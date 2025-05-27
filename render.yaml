@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: weather-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0 
