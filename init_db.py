@@ -8,6 +8,19 @@ def init_db():
     cursor = conn.cursor()
     
     try:
+        # Создаем таблицу пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                language_code TEXT,
+                is_premium BOOLEAN,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
         # Создаем таблицу подписок
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS subscriptions (

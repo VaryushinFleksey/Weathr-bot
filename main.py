@@ -386,6 +386,34 @@ def check_weather_alerts(weather_data):
     
     return alerts
 
+def save_user_info(user: types.User):
+    """Сохраняет информацию о пользователе в базу данных"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO users (
+                    user_id, username, first_name, last_name,
+                    language_code, is_premium, joined_at
+                ) VALUES (?, ?, ?, ?, ?, ?, COALESCE(
+                    (SELECT joined_at FROM users WHERE user_id = ?),
+                    CURRENT_TIMESTAMP
+                ))
+            ''', (
+                user.id,
+                user.username,
+                user.first_name,
+                user.last_name,
+                user.language_code,
+                user.is_premium,
+                user.id
+            ))
+            conn.commit()
+            logger.info(f"User info saved: {user.id} ({user.username or user.first_name})")
+    except Exception as e:
+        log_error(e, f"Error saving user info for user {user.id}")
+        raise
+
 @dp.message(CommandStart())
 @log_execution
 async def start_command(message: Message):
@@ -2956,32 +2984,3 @@ def get_weather_stats(city: str, hours: int = 24) -> dict:
 
 # Инициализируем базу данных при запуске
 init_db()
-
-# Добавляем функцию для сохранения информации о пользователе
-def save_user_info(user: types.User):
-    """Сохраняет информацию о пользователе в базу данных"""
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO users (
-                    user_id, username, first_name, last_name,
-                    language_code, is_premium, joined_at
-                ) VALUES (?, ?, ?, ?, ?, ?, COALESCE(
-                    (SELECT joined_at FROM users WHERE user_id = ?),
-                    CURRENT_TIMESTAMP
-                ))
-            ''', (
-                user.id,
-                user.username,
-                user.first_name,
-                user.last_name,
-                user.language_code,
-                user.is_premium,
-                user.id
-            ))
-            conn.commit()
-            logger.info(f"User info saved: {user.id} ({user.username or user.first_name})")
-    except Exception as e:
-        log_error(e, f"Error saving user info for user {user.id}")
-        raise
