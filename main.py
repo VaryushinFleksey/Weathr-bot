@@ -18,19 +18,92 @@ import json
 from collections import defaultdict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from contextlib import suppress
-
-# Load environment variables
-load_dotenv()
+import traceback
+import functools
+from aiohttp import ClientTimeout
+from asyncio import Lock
+import time as time_module
+import sqlite3
+from contextlib import contextmanager
 
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
+logger = logging.getLogger(__name__)
 
-# Get environment variables
+# Rate limiting configuration
+RATE_LIMIT = 1  # seconds between requests
+rate_limit_dict = defaultdict(lambda: 0)
+rate_limit_lock = Lock()
+
+# API timeout settings
+API_TIMEOUT = ClientTimeout(total=10)  # 10 seconds timeout for API calls
+
+# Load environment variables
+load_dotenv()
+
+# Get and validate environment variables
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
+
+if not TELEGRAM_BOT_TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN not found in environment variables")
+    sys.exit(1)
+
+if not OPENWEATHER_API_KEY:
+    logger.error("OPENWEATHER_API_KEY not found in environment variables")
+    sys.exit(1)
+
+# Rate limiting decorator
+def rate_limit(limit: float):
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            message = next((arg for arg in args if isinstance(arg, Message)), None)
+            if message:
+                user_id = message.from_user.id
+                async with rate_limit_lock:
+                    last_time = rate_limit_dict[user_id]
+                    current_time = time_module.time()
+                    if current_time - last_time < limit:
+                        await message.answer(
+                            "Пожалуйста, подождите немного перед следующим запросом."
+                        )
+                        return
+                    rate_limit_dict[user_id] = current_time
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+# Добавляем функцию для логирования ошибок с полным трейсбеком
+def log_error(error: Exception, message: str = None):
+    """Логирует ошибку с полным трейсбеком"""
+    if message:
+        logger.error(f"{message}: {str(error)}")
+    else:
+        logger.error(str(error))
+    logger.error(traceback.format_exc())
+
+# Декоратор для отслеживания выполнения функций
+def log_execution(func):
+    """Декоратор для логирования выполнения функций"""
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        logger.info(f"Entering function: {func.__name__}")
+        try:
+            result = await func(*args, **kwargs)
+            logger.info(f"Successfully completed: {func.__name__}")
+            return result
+        except Exception as e:
+            log_error(e, f"Error in {func.__name__}")
+            raise
+    return wrapper
 
 # Initialize bot and dispatcher
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -314,30 +387,40 @@ def check_weather_alerts(weather_data):
     return alerts
 
 @dp.message(CommandStart())
+@log_execution
 async def start_command(message: Message):
-    """Send a message when the command /start is issued."""
-    await message.answer(
-        'Привет! Я бот прогноза погоды. 🌤\n'
-        'Я могу:\n'
-        '1. Показать текущую погоду (просто напишите город)\n'
-        '2. Прогноз на 5 дней (/forecast город)\n'
-        '3. Подробную информацию о погоде (/detailed город)\n'
-        '4. Качество воздуха (/air город)\n'
-        '5. Определить погоду по геолокации\n'
-        '6. Сравнить погоду в разных городах (/compare)\n'
-        '7. Показать погодные предупреждения (/alerts город)\n'
-        '8. Получить рекомендации по одежде (/wear город)\n'
-        '9. Получить карту осадков (/rain город)\n'
-        '10. Подписаться на уведомления о погоде (/subscribe город)\n'
-        '11. Отписаться от уведомлений (/unsubscribe город)\n'
-        '12. Получить статистику погоды (/stats город)\n'
-        '13. Найти укрытие от непогоды (/shelter)\n'
-        '14. Настроить умные уведомления (/preferences)\n'
-        '15. Настроить предпочитаемые активности (/activities)\n'
-        '16. Установить время уведомлений (/notifytime)\n\n'
-        'Используйте кнопку ниже, чтобы отправить свою геолокацию!',
-        reply_markup=create_main_keyboard()
-    )
+    """Обработчик команды /start"""
+    try:
+        user_id = message.from_user.id
+        user_name = message.from_user.first_name
+        
+        # Создаем настройки по умолчанию для нового пользователя
+        if user_id not in user_preferences:
+            user_preferences[user_id] = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+            save_user_preferences()
+        
+        await message.answer(
+            f"👋 Привет, {user_name}!\n\n"
+            "Я бот погоды с умными уведомлениями. Вот что я умею:\n\n"
+            "🌤 /weather [город] - текущая погода\n"
+            "🔔 /subscribe [город] - подписка на уведомления\n"
+            "🚫 /unsubscribe [город] - отписка от уведомлений\n"
+            "📋 /list - список ваших подписок\n"
+            "⚙️ /preferences - настройка уведомлений\n"
+            "🏃‍♂️ /activities - настройка активностей\n"
+            "🏘 /shelter [город] - найти укрытие от непогоды\n\n"
+            "Используйте эти команды для управления подписками и настройками."
+        )
+        logger.info(f"New user started bot: {user_id} ({user_name})")
+    except Exception as e:
+        log_error(e, f"Error in start command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при обработке команды. Попробуйте позже.")
 
 @dp.message(Command('help'))
 async def help_command(message: Message):
@@ -979,66 +1062,13 @@ async def process_zoom(callback_query: types.CallbackQuery):
         logging.error(f"Error in process_zoom: {e}")
         await callback_query.answer("Произошла ошибка при изменении масштаба")
 
+@log_execution
 async def get_city_coordinates(city_name: str) -> tuple[float, float, str] | None:
-    """
-    Получает координаты города с поддержкой разных языков и форматов написания.
-    Возвращает кортеж (lat, lon, normalized_city_name) или None если город не найден.
-    """
+    """Получает координаты города с поддержкой разных языков и форматов написания."""
     try:
-        # Список API для поиска города (в порядке приоритета)
-        search_apis = [
-            # OpenWeatherMap Geocoding API
-            {
-                'url': lambda city: f"http://api.openweathermap.org/geo/1.0/direct?q={quote(city)}&limit=1&appid={OPENWEATHER_API_KEY}&lang=ru",
-                'extract': lambda data: (
-                    float(data[0]['lat']),
-                    float(data[0]['lon']),
-                    data[0].get('local_names', {}).get('ru') or data[0]['name']
-                ) if data else None
-            },
-            # Nominatim API
-            {
-                'url': lambda city: (
-                    f"https://nominatim.openstreetmap.org/search"
-                    f"?format=json&q={quote(city)}&limit=1&country=ru"
-                ),
-                'headers': {'User-Agent': 'WeatherBot/1.0'},
-                'extract': lambda data: (
-                    float(data[0]['lat']),
-                    float(data[0]['lon']),
-                    data[0]['display_name'].split(',')[0]
-                ) if data else None
-            },
-            # Дополнительный поиск через OpenWeatherMap без языка
-            {
-                'url': lambda city: f"http://api.openweathermap.org/geo/1.0/direct?q={quote(city)}&limit=1&appid={OPENWEATHER_API_KEY}",
-                'extract': lambda data: (
-                    float(data[0]['lat']),
-                    float(data[0]['lon']),
-                    data[0]['name']
-                ) if data else None
-            }
-        ]
-
-        # Пробуем каждый API по очереди
-        async with aiohttp.ClientSession() as session:
-            for api in search_apis:
-                try:
-                    headers = api.get('headers', {})
-                    url = api['url'](city_name)
-                    
-                    async with session.get(url, headers=headers) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            if data:  # Если получили непустой ответ
-                                result = api['extract'](data)
-                                if result:
-                                    return result
-                except Exception as e:
-                    logging.warning(f"Error with geocoding API: {e}")
-                    continue
-
-        # Если город все еще не найден, пробуем прямой поиск по базе городов России
+        logger.info(f"Searching coordinates for city: {city_name}")
+        
+        # Сначала проверяем в базе российских городов
         russian_cities = {
             'москва': (55.7558, 37.6173, 'Москва'),
             'санкт-петербург': (59.9343, 30.3351, 'Санкт-Петербург'),
@@ -1062,176 +1092,78 @@ async def get_city_coordinates(city_name: str) -> tuple[float, float, str] | Non
             'ижевск': (56.8498, 53.2045, 'Ижевск')
         }
 
-        # Проверяем совпадение с базой городов (с учетом разных вариантов написания)
-        city_lower = city_name.lower().replace('ё', 'е')
+        # Нормализуем введенный город
+        city_lower = city_name.lower().replace('ё', 'е').strip()
+        
+        # Проверяем точное совпадение
+        if city_lower in russian_cities:
+            logger.info(f"Found exact match in Russian cities database: {city_lower}")
+            return russian_cities[city_lower]
+            
+        # Проверяем частичное совпадение
         for known_city, coords in russian_cities.items():
-            if city_lower == known_city or city_lower in known_city or known_city in city_lower:
+            if city_lower in known_city or known_city in city_lower:
+                logger.info(f"Found partial match in Russian cities database: {known_city}")
                 return coords
 
-        # Если город не найден всеми способами
-        return None
+        # Если город не найден в базе, используем API
+        search_apis = [
+            # OpenWeatherMap Geocoding API с русской локализацией
+            {
+                'url': lambda city: f"http://api.openweathermap.org/geo/1.0/direct?q={quote(city)}&limit=1&appid={OPENWEATHER_API_KEY}&lang=ru",
+                'extract': lambda data: (
+                    float(data[0]['lat']),
+                    float(data[0]['lon']),
+                    data[0].get('local_names', {}).get('ru') or data[0]['name']
+                ) if data else None
+            },
+            # Nominatim API с фокусом на Россию
+            {
+                'url': lambda city: (
+                    f"https://nominatim.openstreetmap.org/search"
+                    f"?format=json&q={quote(city)}&limit=1&countrycodes=ru"
+                ),
+                'headers': {'User-Agent': 'WeatherBot/1.0'},
+                'extract': lambda data: (
+                    float(data[0]['lat']),
+                    float(data[0]['lon']),
+                    data[0]['display_name'].split(',')[0]
+                ) if data else None
+            }
+        ]
 
-    except Exception as e:
-        logging.error(f"Error in get_city_coordinates: {e}")
-        return None
-
-@dp.message(lambda message: not message.text.startswith('/'))
-async def get_weather(message: Message):
-    """Get current weather for the specified city."""
-    if message.text == "ℹ️ Помощь":
-        await help_command(message)
-        return
-
-    try:
-        # Получаем координаты города
-        result = await get_city_coordinates(message.text)
-        if not result:
-            await message.answer(
-                "Извините, не могу найти такой город. Попробуйте:\n"
-                "1. Проверить правильность написания\n"
-                "2. Использовать название на русском или английском\n"
-                "3. Указать более крупный город поблизости"
-            )
-            return
-            
-        lat, lon, normalized_city = result
-        
-        # Get weather data
-        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        # Пробуем каждый API по очереди
         async with aiohttp.ClientSession() as session:
-            async with session.get(weather_url) as response:
-                weather_data = await response.json()
-        
-        # Check for weather alerts
-        alerts = check_weather_alerts(weather_data)
-        
-        # Format and send detailed weather information
-        detailed_message = format_detailed_weather(weather_data, normalized_city)
-        if alerts:
-            detailed_message += "\n\n" + "\n".join(alerts)
-        await message.answer(detailed_message)
-        
-    except Exception as e:
-        logging.error(f"Error getting weather: {e}")
-        await message.answer(
-            "Извините, произошла ошибка при получении прогноза погоды. "
-            "Пожалуйста, попробуйте позже."
-        )
-
-async def process_update(request):
-    """Обработчик входящих обновлений от Telegram"""
-    data = await request.json()
-    update = types.Update(**data)
-    await dp.feed_update(bot=bot, update=update)
-    return web.Response()
-
-async def healthcheck(request):
-    """Простой обработчик для проверки работоспособности"""
-    return web.Response(text="Bot is running")
-
-async def shutdown(dispatcher: Dispatcher):
-    """Корректное завершение работы бота"""
-    logging.info("Shutting down...")
-    
-    # Отключаем планировщик
-    if scheduler:
-        scheduler.shutdown(wait=False)
-    
-    # Закрываем соединения
-    await dispatcher.storage.close()
-    await dispatcher.storage.wait_closed()
-    
-    # Закрываем сессию бота
-    session = await bot.get_session()
-    if session:
-        await session.close()
-    
-    # Останавливаем веб-приложение
-    if runner:
-        await runner.cleanup()
-
-async def on_shutdown(app):
-    """Действия при завершении работы веб-приложения"""
-    logging.info("Stopping web application...")
-    await shutdown(dp)
-
-async def on_startup(app):
-    """Действия при запуске"""
-    webhook_path = f"/webhook/{TELEGRAM_BOT_TOKEN}"
-    webhook_url = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:8080') + webhook_path
-    
-    # Устанавливаем вебхук
-    await bot.set_webhook(
-        url=webhook_url,
-        drop_pending_updates=True
-    )
-    
-    # Устанавливаем команды бота
-    await bot.set_my_commands(COMMANDS)
-    print(f"Webhook set to {webhook_url}")
-    print("Bot commands updated successfully")
-
-async def check_weather_conditions(city, lat, lon):
-    """Проверяет погодные условия и формирует предупреждения"""
-    try:
-        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(weather_url) as response:
-                weather_data = await response.json()
-        
-        warnings = []
-        
-        # Проверяем температуру
-        temp = weather_data['main']['temp']
-        if temp > 30:
-            warnings.append(f"🌡 Сильная жара в {city}: {temp:.1f}°C")
-        elif temp < -15:
-            warnings.append(f"❄️ Сильный мороз в {city}: {temp:.1f}°C")
-        
-        # Проверяем осадки
-        if 'rain' in weather_data:
-            rain = weather_data['rain'].get('1h', 0)
-            if rain > 10:
-                warnings.append(f"🌧 Сильный дождь в {city}: {rain} мм/ч")
-        if 'snow' in weather_data:
-            snow = weather_data['snow'].get('1h', 0)
-            if snow > 5:
-                warnings.append(f"🌨 Сильный снег в {city}: {snow} мм/ч")
-        
-        # Проверяем ветер
-        wind_speed = weather_data['wind']['speed']
-        if wind_speed > 15:
-            warnings.append(f"💨 Сильный ветер в {city}: {wind_speed} м/с")
-        
-        # Обновляем статистику
-        for param in ['temp', 'humidity', 'pressure']:
-            weather_stats[city][param].append(weather_data['main'][param])
-            # Храним только последние 24 значения
-            weather_stats[city][param] = weather_stats[city][param][-24:]
-        
-        return warnings
-        
-    except Exception as e:
-        logging.error(f"Error checking weather conditions: {e}")
-        return []
-
-async def send_weather_alerts():
-    """Отправляет уведомления о погоде подписчикам"""
-    for user_id, subscriptions in weather_subscriptions.items():
-        for city, lat, lon in subscriptions:
-            warnings = await check_weather_conditions(city, lat, lon)
-            if warnings:
+            for api in search_apis:
                 try:
-                    await bot.send_message(
-                        user_id,
-                        "⚠️ Предупреждения о погоде:\n" + "\n".join(warnings)
-                    )
+                    headers = api.get('headers', {})
+                    url = api['url'](city_name)
+                    logger.info(f"Trying API: {url}")
+                    
+                    async with session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if data:  # Если получили непустой ответ
+                                result = api['extract'](data)
+                                if result:
+                                    logger.info(f"Found city via API: {result[2]}")
+                                    return result
                 except Exception as e:
-                    logging.error(f"Error sending alert to user {user_id}: {e}")
+                    logger.warning(f"Error with geocoding API: {e}")
+                    continue
 
+        logger.warning(f"City not found: {city_name}")
+        return None
+
+    except Exception as e:
+        log_error(e, f"Error in get_city_coordinates for city {city_name}")
+        return None
+
+@log_execution
 async def find_nearby_shelters(lat, lon):
     """Находит ближайшие места укрытия от непогоды"""
     try:
+        logger.info(f"Searching shelters near coordinates: {lat}, {lon}")
         # Используем OpenStreetMap Nominatim API для поиска ближайших мест
         search_url = (
             f"https://nominatim.openstreetmap.org/search"
@@ -1252,93 +1184,1316 @@ async def find_nearby_shelters(lat, lon):
         return []
 
 @dp.message(Command('subscribe'))
+@log_execution
+@rate_limit(RATE_LIMIT)
 async def subscribe_command(message: Message):
-    """Подписка на уведомления о погоде"""
+    """Обработчик команды /subscribe"""
     try:
-        city = message.text.split(' ', 1)[1]
-    except IndexError:
-        await message.answer(
-            "Пожалуйста, укажите город после команды.\n"
-            "Например: /subscribe Москва"
-        )
-        return
-
-    try:
+        user_id = message.from_user.id
+        
+        try:
+            city = message.text.split(' ', 1)[1]
+        except IndexError:
+            await message.answer(
+                "Пожалуйста, укажите город после команды.\n"
+                "Например: /subscribe Москва"
+            )
+            return
+        
         # Получаем координаты города
         result = await get_city_coordinates(city)
         if not result:
             await message.answer(
-                "Извините, не могу найти указанный город. Пожалуйста:\n"
-                "1. Проверьте правильность написания\n"
-                "2. Убедитесь, что название города написано правильно\n"
-                "3. Попробуйте указать более крупный город поблизости\n\n"
-                "Примеры правильного написания:\n"
-                "✅ Саратов\n"
-                "✅ Нижний Новгород\n"
-                "✅ Санкт-Петербург"
+                "Извините, не могу найти такой город. Попробуйте:\n"
+                "1. Проверить правильность написания\n"
+                "2. Использовать название на русском или английском\n"
+                "3. Указать более точное название"
             )
             return
             
-        lat, lon, normalized_city = result
+        lat, lon, city_name = result
+        
+        # Проверяем существующие подписки
+        subscriptions = get_user_subscriptions(user_id)
+        
+        # Проверяем, не подписан ли уже пользователь на этот город
+        if any(sub[0].lower() == city_name.lower() for sub in subscriptions):
+            await message.answer(f"Вы уже подписаны на погоду в городе {city_name}")
+            return
+        
+        # Проверяем количество подписок (ограничение на 5 городов)
+        if len(subscriptions) >= 5:
+            await message.answer(
+                "Вы уже подписаны на максимальное количество городов (5).\n"
+                "Чтобы подписаться на новый город, сначала отпишитесь от одного из текущих:\n" +
+                "\n".join(f"• {city} (/unsubscribe {city})" for city, _, _ in subscriptions)
+            )
+            return
         
         # Добавляем подписку
-        user_id = message.from_user.id
-        if (normalized_city, lat, lon) not in weather_subscriptions[user_id]:
-            weather_subscriptions[user_id].append((normalized_city, lat, lon))
-            save_subscriptions()
-            
-            # Сразу получаем текущую погоду для подтверждения
-            weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(weather_url) as response:
-                    weather_data = await response.json()
-            
-            await message.answer(
-                f"✅ Вы успешно подписались на уведомления о погоде в городе {normalized_city}\n\n"
-                f"Текущая погода:\n"
-                f"🌡 Температура: {weather_data['main']['temp']:.1f}°C\n"
-                f"☁️ {weather_data['weather'][0]['description']}"
-            )
-        else:
-            await message.answer(f"Вы уже подписаны на уведомления о погоде в городе {normalized_city}")
+        save_subscription(user_id, city_name, lat, lon)
+        
+        # Создаем настройки по умолчанию, если их нет
+        prefs = get_user_preferences_db(user_id)
+        if not prefs:
+            default_prefs = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+            save_user_preferences_db(user_id, default_prefs)
+        
+        # Получаем текущую погоду для подтверждения
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession(timeout=API_TIMEOUT) as session:
+            async with session.get(weather_url) as response:
+                weather_data = await check_api_response(response, "subscribe_command")
+        
+        # Сохраняем статистику
+        save_weather_stats(
+            city_name,
+            weather_data['main']['temp'],
+            weather_data['main']['humidity'],
+            weather_data['wind']['speed']
+        )
+        
+        # Формируем сообщение с подтверждением
+        confirmation = (
+            f"✅ Вы успешно подписались на уведомления о погоде в городе {city_name}\n\n"
+            f"Текущая погода:\n"
+            f"🌡 Температура: {weather_data['main']['temp']:.1f}°C\n"
+            f"☁️ {weather_data['weather'][0]['description']}\n\n"
+            f"Вы будете получать:\n"
+            f"• Уведомления о важных изменениях погоды\n"
+            f"• Предупреждения о неблагоприятных условиях\n"
+            f"• Ежедневный прогноз в выбранное время\n\n"
+            f"Чтобы настроить уведомления, используйте:\n"
+            f"⚙️ /preferences - общие настройки уведомлений\n"
+            f"⏰ /notifytime - время ежедневных уведомлений\n"
+            f"🎯 /activities - настройка предпочитаемых активностей"
+        )
+        
+        await message.answer(confirmation)
+        logger.info(f"User {user_id} subscribed to {city_name}")
         
     except Exception as e:
-        logging.error(f"Error in subscribe_command: {e}")
-        await message.answer(
-            "Извините, произошла ошибка при подписке на уведомления. "
-            "Пожалуйста, попробуйте позже."
-        )
+        log_error(e, f"Error in subscribe command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при подписке. Попробуйте позже.")
 
 @dp.message(Command('unsubscribe'))
+@log_execution
+@rate_limit(RATE_LIMIT)
 async def unsubscribe_command(message: Message):
-    """Отписка от уведомлений о погоде"""
+    """Обработчик команды /unsubscribe"""
+    try:
+        user_id = message.from_user.id
+        
+        try:
+            city = message.text.split(' ', 1)[1]
+        except IndexError:
+            await message.answer(
+                "Пожалуйста, укажите город после команды.\n"
+                "Например: /unsubscribe Москва"
+            )
+            return
+        
+        # Получаем подписки пользователя
+        subscriptions = get_user_subscriptions(user_id)
+        if not subscriptions:
+            await message.answer("У вас нет активных подписок на погоду")
+            return
+        
+        # Ищем город в подписках
+        city_lower = city.lower()
+        for subscribed_city, _, _ in subscriptions:
+            if subscribed_city.lower() == city_lower:
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        'DELETE FROM subscriptions WHERE user_id = ? AND city = ?',
+                        (user_id, subscribed_city)
+                    )
+                await message.answer(f"✅ Вы успешно отписались от погоды в городе {subscribed_city}")
+                logger.info(f"User {user_id} unsubscribed from {subscribed_city}")
+                return
+        
+        await message.answer(f"Вы не подписаны на погоду в городе {city}")
+        
+    except Exception as e:
+        log_error(e, f"Error in unsubscribe command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при отписке. Попробуйте позже.")
+
+@dp.message(Command('stats'))
+@log_execution
+@rate_limit(RATE_LIMIT)
+async def stats_command(message: Message):
+    """Показывает статистику погоды"""
     try:
         city = message.text.split(' ', 1)[1]
     except IndexError:
         await message.answer(
             "Пожалуйста, укажите город после команды.\n"
-            "Например: /unsubscribe Москва"
+            "Например: /stats Москва"
         )
         return
 
     try:
-        user_id = message.from_user.id
-        # Находим и удаляем подписку
-        for sub in weather_subscriptions[user_id][:]:
-            if sub[0].lower() == city.lower():
-                weather_subscriptions[user_id].remove(sub)
-                save_subscriptions()
-                await message.answer(f"✅ Вы успешно отписались от уведомлений о погоде в городе {city}")
-                return
+        # Получаем статистику из базы данных
+        stats = get_weather_stats(city)
+        if not stats:
+            await message.answer(
+                f"Извините, для города {city} пока нет статистики. "
+                "Статистика начнет собираться после подписки на уведомления."
+            )
+            return
         
-        await message.answer(f"Вы не были подписаны на уведомления о погоде в городе {city}")
+        # Формируем сообщение со статистикой
+        message_text = (
+            f"📊 Статистика погоды в городе {city} (за последние 24 часа):\n\n"
+            f"🌡 Температура:\n"
+            f"   • Средняя: {stats['temp_avg']:.1f}°C\n"
+            f"   • Минимальная: {stats['temp_min']:.1f}°C\n"
+            f"   • Максимальная: {stats['temp_max']:.1f}°C\n"
+            f"💧 Средняя влажность: {stats['humidity_avg']:.1f}%\n"
+            f"💨 Средняя скорость ветра: {stats['wind_speed_avg']:.1f} м/с"
+        )
+        
+        await message.answer(message_text)
         
     except Exception as e:
-        logging.error(f"Error in unsubscribe_command: {e}")
+        log_error(e, f"Error in stats command for user {message.from_user.id}")
         await message.answer(
-            "Извините, произошла ошибка при отписке от уведомлений. "
+            "Извините, произошла ошибка при получении статистики. "
             "Пожалуйста, попробуйте позже."
         )
+
+@dp.message(Command('shelter'))
+@log_execution
+async def shelter_command(message: Message):
+    """Поиск укрытия от непогоды"""
+    try:
+        user_id = message.from_user.id
+        logger.info(f"Processing shelter command for user {user_id}")
+        
+        # Проверяем, передано ли название города
+        try:
+            city = message.text.split(' ', 1)[1]
+            logger.info(f"Searching shelters for city: {city}")
+            
+            # Получаем координаты города
+            result = await get_city_coordinates(city)
+            if not result:
+                await message.answer(
+                    "Извините, не могу найти такой город. Попробуйте:\n"
+                    "1. Проверить правильность написания\n"
+                    "2. Использовать название на русском или английском\n"
+                    "3. Указать более крупный город поблизости\n\n"
+                    "Или отправьте свою геолокацию, нажав на кнопку ниже 📍",
+                    reply_markup=ReplyKeyboardMarkup(
+                        keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
+                        resize_keyboard=True,
+                        one_time_keyboard=True
+                    )
+                )
+                return
+                
+            lat, lon, normalized_city = result
+            logger.info(f"Found coordinates for {normalized_city}: {lat}, {lon}")
+            
+        except IndexError:
+            # Если город не указан, запрашиваем геолокацию
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
+                resize_keyboard=True,
+                one_time_keyboard=True
+            )
+            await message.answer(
+                "Пожалуйста, отправьте свою геолокацию, нажав на кнопку ниже, "
+                "или укажите название города после команды:\n"
+                "Например: /shelter Москва",
+                reply_markup=keyboard
+            )
+            return
+        
+        # Получаем список ближайших укрытий
+        shelters = await find_nearby_shelters(lat, lon)
+        logger.info(f"Found {len(shelters)} shelters near {normalized_city}")
+        
+        if not shelters:
+            await message.answer(
+                "Извините, не удалось найти укрытия поблизости. "
+                "Попробуйте искать торговые центры или кафе в этом районе."
+            )
+            return
+        
+        # Формируем сообщение с укрытиями
+        message_text = f"🏪 Ближайшие места, где можно укрыться от непогоды в районе {normalized_city}:\n\n"
+        
+        # Создаем список кнопок для каждого укрытия
+        keyboard_buttons = []
+        
+        for place in shelters:
+            distance = ((float(place['lat']) - lat) ** 2 + (float(place['lon']) - lon) ** 2) ** 0.5 * 111  # примерное расстояние в км
+            name = place['display_name'].split(',')[0]
+            address = ', '.join(place['display_name'].split(',')[1:]).strip()
+            
+            message_text += (
+                f"📍 {name}\n"
+                f"   📏 Расстояние: {distance:.1f} км\n"
+                f"   🏠 Адрес: {address}\n\n"
+            )
+            
+            # Добавляем кнопку для этого места
+            keyboard_buttons.append([
+                InlineKeyboardButton(
+                    text=f"🗺 {name} на карте",
+                    url=f"https://www.openstreetmap.org/?mlat={place['lat']}&mlon={place['lon']}&zoom=17"
+                )
+            ])
+        
+        # Создаем клавиатуру с кнопками для всех укрытий
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        
+        # Отправляем сообщение с информацией и кнопками
+        await message.answer(message_text, reply_markup=keyboard)
+        logger.info(f"Successfully sent shelter information to user {user_id}")
+        
+    except Exception as e:
+        log_error(e, f"Error in shelter_command for user {message.from_user.id}")
+        await message.answer(
+            "Извините, произошла ошибка при поиске укрытий. "
+            "Пожалуйста, попробуйте позже."
+        )
+
+def save_subscriptions():
+    """Сохраняет подписки в файл"""
+    try:
+        with open('subscriptions.json', 'w', encoding='utf-8') as f:
+            json.dump(weather_subscriptions, f, ensure_ascii=False, indent=2)
+        logger.info("Subscriptions saved successfully")
+    except Exception as e:
+        log_error(e, "Error saving subscriptions")
+
+def load_subscriptions():
+    """Загружает подписки из файла"""
+    global weather_subscriptions
+    try:
+        with open('subscriptions.json', 'r', encoding='utf-8') as f:
+            weather_subscriptions = json.load(f)
+        logger.info("Subscriptions loaded successfully")
+    except FileNotFoundError:
+        weather_subscriptions = defaultdict(list)
+        logger.info("No subscriptions file found, starting with empty list")
+    except Exception as e:
+        log_error(e, "Error loading subscriptions")
+        weather_subscriptions = defaultdict(list)
+
+def save_user_preferences():
+    """Сохраняет пользовательские настройки в файл"""
+    try:
+        with open('preferences.json', 'w', encoding='utf-8') as f:
+            json.dump(user_preferences, f, ensure_ascii=False, indent=2)
+        logger.info("User preferences saved successfully")
+    except Exception as e:
+        log_error(e, "Error saving user preferences")
+
+def load_user_preferences():
+    """Загружает пользовательские настройки из файла"""
+    global user_preferences
+    try:
+        with open('preferences.json', 'r', encoding='utf-8') as f:
+            user_preferences = json.load(f)
+        logger.info("User preferences loaded successfully")
+    except FileNotFoundError:
+        user_preferences = {}
+        logger.info("No preferences file found, starting with empty dict")
+    except Exception as e:
+        log_error(e, "Error loading user preferences")
+        user_preferences = {}
+
+async def check_weather_changes(city, lat, lon, prev_temp):
+    """Проверяет резкие изменения погоды"""
+    try:
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                weather_data = await response.json()
+        
+        curr_temp = weather_data['main']['temp']
+        temp_change = abs(curr_temp - prev_temp)
+        
+        if temp_change >= 5:  # Изменение на 5°C или более
+            return f"🌡 Резкое изменение температуры в {city}: {temp_change:.1f}°C"
+        return None
+        
+    except Exception as e:
+        logging.error(f"Error checking weather changes: {e}")
+        return None
+
+async def check_activity_conditions(city, lat, lon, activities):
+    """Проверяет условия для активностей"""
+    try:
+        logger.info(f"Checking activity conditions for {city}")
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                weather_data = await check_api_response(response, "check_activity_conditions")
+        
+        temp = weather_data['main']['temp']
+        wind_speed = weather_data['wind']['speed']
+        is_rain = 'rain' in weather_data
+        
+        suitable_activities = []
+        
+        for activity in activities:
+            if activity not in ACTIVITIES:
+                continue
+                
+            conditions = ACTIVITIES[activity]
+            temp_min, temp_max = conditions['temp_range']
+            
+            if (temp_min <= temp <= temp_max and
+                wind_speed <= conditions['wind_max'] and
+                (not conditions['no_rain'] or not is_rain)):
+                suitable_activities.append(conditions['description'])
+        
+        if suitable_activities:
+            return f"🎯 Отличные условия в {city} для: {', '.join(suitable_activities)}!"
+        return None
+        
+    except Exception as e:
+        log_error(e, f"Error checking activity conditions for {city}")
+        return None
+
+@log_execution
+async def send_smart_notifications():
+    """Отправляет умные уведомления пользователям"""
+    logger.info("Starting smart notifications check")
+    current_hour = datetime.now().strftime('%H:00')
+    
+    for user_id, prefs in user_preferences.items():
+        if prefs['notification_time'] != current_hour:
+            continue
+            
+        try:
+            for city, lat, lon in weather_subscriptions[user_id]:
+                notifications = []
+                
+                # Проверяем условия для активностей
+                if prefs['activities']:
+                    activity_notice = await check_activity_conditions(city, lat, lon, prefs['activities'])
+                    if activity_notice:
+                        notifications.append(activity_notice)
+                
+                # Получаем текущую погоду
+                weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(weather_url) as response:
+                        weather_data = await check_api_response(response, "send_smart_notifications")
+                
+                temp = weather_data['main']['temp']
+                
+                # Проверяем температурный диапазон
+                if not (prefs['temp_range']['min'] <= temp <= prefs['temp_range']['max']):
+                    notifications.append(
+                        f"🌡 Температура в {city} ({temp:.1f}°C) вне вашего комфортного диапазона "
+                        f"({prefs['temp_range']['min']}°C - {prefs['temp_range']['max']}°C)"
+                    )
+                
+                # Проверяем ветер
+                wind_speed = weather_data['wind']['speed']
+                if wind_speed > prefs['wind_threshold']:
+                    notifications.append(f"💨 Сильный ветер в {city}: {wind_speed} м/с")
+                
+                # Проверяем дождь
+                if prefs['rain_alerts'] and 'rain' in weather_data:
+                    rain = weather_data['rain'].get('1h', 0)
+                    if rain > 0:
+                        notifications.append(f"🌧 Ожидается дождь в {city}: {rain} мм/ч")
+                
+                if notifications:
+                    await bot.send_message(
+                        user_id,
+                        "🔔 Умные уведомления:\n\n" + "\n\n".join(notifications)
+                    )
+                    logger.info(f"Sent {len(notifications)} smart notifications to user {user_id} for {city}")
+                    
+        except Exception as e:
+            log_error(e, f"Error sending smart notifications to user {user_id}")
+
+@dp.message(Command('preferences'))
+@log_execution
+@rate_limit(RATE_LIMIT)
+async def preferences_command(message: Message):
+    """Обработчик команды /preferences"""
+    try:
+        user_id = message.from_user.id
+        
+        # Получаем текущие настройки
+        prefs = get_user_preferences_db(user_id)
+        if not prefs:
+            # Создаем настройки по умолчанию
+            prefs = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+            save_user_preferences_db(user_id, prefs)
+        
+        # Формируем сообщение с текущими настройками
+        settings_text = (
+            "⚙️ Ваши текущие настройки:\n\n"
+            f"⏰ Время уведомлений: {prefs['notification_time']}\n"
+            f"🌡 Диапазон комфортной температуры: {prefs['temp_range']['min']}°C - {prefs['temp_range']['max']}°C\n"
+            f"💨 Порог скорости ветра: {prefs['wind_threshold']} м/с\n"
+            f"🌧 Уведомления о дожде: {'Включены' if prefs['rain_alerts'] else 'Выключены'}\n"
+            f"🎯 Активности: {', '.join(prefs['activities']) if prefs['activities'] else 'Не указаны'}\n\n"
+            "Для изменения настроек используйте команды:\n"
+            "/notifytime [ЧЧ:ММ] - изменить время уведомлений\n"
+            "/temprange [мин] [макс] - изменить диапазон температур\n"
+            "/wind [порог] - изменить порог ветра\n"
+            "/rainalerts [on/off] - вкл/выкл уведомления о дожде\n"
+            "/activities - настроить предпочитаемые активности"
+        )
+        
+        await message.answer(settings_text)
+        
+    except Exception as e:
+        log_error(e, f"Error in preferences command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при получении настроек. Попробуйте позже.")
+
+@dp.message(Command('notifytime'))
+@log_execution
+@rate_limit(RATE_LIMIT)
+async def notifytime_command(message: Message):
+    """Обработчик команды /notifytime"""
+    try:
+        user_id = message.from_user.id
+        
+        try:
+            time_str = message.text.split(' ', 1)[1]
+            # Проверяем формат времени
+            datetime.strptime(time_str, '%H:%M')
+        except (IndexError, ValueError):
+            await message.answer(
+                "Пожалуйста, укажите время в формате ЧЧ:ММ\n"
+                "Например: /notifytime 09:00"
+            )
+            return
+        
+        # Получаем текущие настройки
+        prefs = get_user_preferences_db(user_id)
+        if not prefs:
+            prefs = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+        
+        # Обновляем время уведомлений
+        prefs['notification_time'] = time_str
+        save_user_preferences_db(user_id, prefs)
+        
+        await message.answer(f"✅ Время ежедневных уведомлений установлено на {time_str}")
+        
+    except Exception as e:
+        log_error(e, f"Error in notifytime command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при изменении времени уведомлений. Попробуйте позже.")
+
+@dp.message(Command('temprange'))
+@log_execution
+@rate_limit(RATE_LIMIT)
+async def temprange_command(message: Message):
+    """Обработчик команды /temprange"""
+    try:
+        user_id = message.from_user.id
+        
+        try:
+            _, min_temp, max_temp = message.text.split()
+            min_temp = int(min_temp)
+            max_temp = int(max_temp)
+            
+            if min_temp >= max_temp:
+                raise ValueError("Минимальная температура должна быть меньше максимальной")
+                
+            if min_temp < -50 or max_temp > 50:
+                raise ValueError("Температура должна быть в диапазоне от -50°C до +50°C")
+                
+        except ValueError as e:
+            await message.answer(
+                "Пожалуйста, укажите минимальную и максимальную температуру через пробел.\n"
+                "Например: /temprange 15 25\n\n"
+                "Температура должна быть:\n"
+                "• В диапазоне от -50°C до +50°C\n"
+                "• Минимальная температура меньше максимальной"
+            )
+            return
+        
+        # Получаем текущие настройки
+        prefs = get_user_preferences_db(user_id)
+        if not prefs:
+            prefs = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+        
+        # Обновляем диапазон температур
+        prefs['temp_range'] = {'min': min_temp, 'max': max_temp}
+        save_user_preferences_db(user_id, prefs)
+        
+        await message.answer(
+            f"✅ Установлен новый диапазон комфортной температуры:\n"
+            f"От {min_temp}°C до {max_temp}°C"
+        )
+        
+    except Exception as e:
+        log_error(e, f"Error in temprange command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при изменении диапазона температур. Попробуйте позже.")
+
+@dp.message(Command('wind'))
+@log_execution
+@rate_limit(RATE_LIMIT)
+async def wind_command(message: Message):
+    """Обработчик команды /wind"""
+    try:
+        user_id = message.from_user.id
+        
+        try:
+            threshold = int(message.text.split(' ', 1)[1])
+            if threshold < 0 or threshold > 50:
+                raise ValueError("Порог ветра должен быть от 0 до 50 м/с")
+        except (IndexError, ValueError):
+            await message.answer(
+                "Пожалуйста, укажите порог скорости ветра в м/с (от 0 до 50).\n"
+                "Например: /wind 10"
+            )
+            return
+        
+        # Получаем текущие настройки
+        prefs = get_user_preferences_db(user_id)
+        if not prefs:
+            prefs = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+        
+        # Обновляем порог ветра
+        prefs['wind_threshold'] = threshold
+        save_user_preferences_db(user_id, prefs)
+        
+        await message.answer(f"✅ Порог скорости ветра установлен на {threshold} м/с")
+        
+    except Exception as e:
+        log_error(e, f"Error in wind command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при изменении порога ветра. Попробуйте позже.")
+
+@dp.message(Command('rainalerts'))
+@log_execution
+@rate_limit(RATE_LIMIT)
+async def rainalerts_command(message: Message):
+    """Обработчик команды /rainalerts"""
+    try:
+        user_id = message.from_user.id
+        
+        try:
+            state = message.text.split(' ', 1)[1].lower()
+            if state not in ['on', 'off']:
+                raise ValueError
+        except (IndexError, ValueError):
+            await message.answer(
+                "Пожалуйста, укажите on для включения или off для выключения.\n"
+                "Например: /rainalerts on"
+            )
+            return
+        
+        # Получаем текущие настройки
+        prefs = get_user_preferences_db(user_id)
+        if not prefs:
+            prefs = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+        
+        # Обновляем настройку уведомлений о дожде
+        prefs['rain_alerts'] = (state == 'on')
+        save_user_preferences_db(user_id, prefs)
+        
+        status = "включены" if state == 'on' else "выключены"
+        await message.answer(f"✅ Уведомления о дожде {status}")
+        
+    except Exception as e:
+        log_error(e, f"Error in rainalerts command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при изменении настроек уведомлений о дожде. Попробуйте позже.")
+
+@dp.message(Command('activities'))
+@log_execution
+@rate_limit(RATE_LIMIT)
+async def activities_command(message: Message):
+    """Обработчик команды /activities"""
+    try:
+        user_id = message.from_user.id
+        
+        # Получаем текущие настройки
+        prefs = get_user_preferences_db(user_id)
+        if not prefs:
+            prefs = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+        
+        # Создаем клавиатуру с активностями
+        activities = [
+            "🏃‍♂️ Бег", "🚶‍♂️ Прогулка", "🚴‍♂️ Велосипед",
+            "⛺️ Пикник", "🎣 Рыбалка", "🏊‍♂️ Плавание",
+            "🏸 Спорт на улице", "🌳 Садоводство", "🎨 Пленэр"
+        ]
+        
+        keyboard = InlineKeyboardMarkup(row_width=3)
+        buttons = []
+        for activity in activities:
+            is_selected = activity in prefs['activities']
+            callback_data = f"activity_{activity}"
+            buttons.append(
+                InlineKeyboardButton(
+                    text=f"{'✅' if is_selected else '❌'} {activity}",
+                    callback_data=callback_data
+                )
+            )
+        keyboard.add(*buttons)
+        
+        await message.answer(
+            "Выберите предпочитаемые активности:\n"
+            "✅ - активность выбрана\n"
+            "❌ - активность не выбрана\n\n"
+            "Бот будет учитывать погодные условия для этих активностей "
+            "при отправке уведомлений.",
+            reply_markup=keyboard
+        )
+        
+    except Exception as e:
+        log_error(e, f"Error in activities command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при настройке активностей. Попробуйте позже.")
+
+@dp.callback_query(lambda c: c.data.startswith('activity_'))
+@log_execution
+async def process_activity_callback(callback_query: types.CallbackQuery):
+    """Обработчик нажатий на кнопки активностей"""
+    try:
+        user_id = callback_query.from_user.id
+        activity = callback_query.data.replace('activity_', '')
+        
+        # Получаем текущие настройки
+        prefs = get_user_preferences_db(user_id)
+        if not prefs:
+            prefs = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+        
+        # Обновляем список активностей
+        if activity in prefs['activities']:
+            prefs['activities'].remove(activity)
+        else:
+            prefs['activities'].append(activity)
+        
+        # Сохраняем обновленные настройки
+        save_user_preferences_db(user_id, prefs)
+        
+        # Обновляем клавиатуру
+        activities = [
+            "🏃‍♂️ Бег", "🚶‍♂️ Прогулка", "🚴‍♂️ Велосипед",
+            "⛺️ Пикник", "🎣 Рыбалка", "🏊‍♂️ Плавание",
+            "🏸 Спорт на улице", "🌳 Садоводство", "🎨 Пленэр"
+        ]
+        
+        keyboard = InlineKeyboardMarkup(row_width=3)
+        buttons = []
+        for act in activities:
+            is_selected = act in prefs['activities']
+            callback_data = f"activity_{act}"
+            buttons.append(
+                InlineKeyboardButton(
+                    text=f"{'✅' if is_selected else '❌'} {act}",
+                    callback_data=callback_data
+                )
+            )
+        keyboard.add(*buttons)
+        
+        # Обновляем сообщение с новой клавиатурой
+        await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+        await callback_query.answer()
+        
+    except Exception as e:
+        log_error(e, f"Error in activity callback for user {callback_query.from_user.id}")
+        await callback_query.answer("Произошла ошибка. Попробуйте позже.", show_alert=True)
+
+async def main():
+    """Start the bot."""
+    global scheduler, app, runner
+    
+    try:
+        # Настраиваем логирование
+        logger.info("Starting bot initialization...")
+        
+        # Загружаем сохраненные данные
+        load_subscriptions()
+        load_user_preferences()
+        logger.info("Loaded saved data")
+        
+        # Инициализируем планировщик
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(send_weather_alerts, 'interval', minutes=30)
+        scheduler.add_job(send_smart_notifications, 'interval', minutes=60)
+        scheduler.start()
+        logger.info("Scheduler started")
+        
+        # Создаем веб-приложение
+        app = web.Application()
+        
+        # Добавляем обработчики
+        webhook_path = f"/webhook/{TELEGRAM_BOT_TOKEN}"
+        app.router.add_post(webhook_path, process_update)
+        app.router.add_get("/", healthcheck)
+        
+        # Добавляем обработчики событий приложения
+        app.on_startup.append(on_startup)
+        app.on_shutdown.append(on_shutdown)
+        
+        # Получаем порт из переменных окружения
+        port = int(os.environ.get('PORT', 8080))
+        
+        # Запускаем веб-сервер
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        
+        # Устанавливаем обработчики сигналов
+        for signal_name in ('SIGINT', 'SIGTERM'):
+            try:
+                signal.signal(
+                    getattr(signal, signal_name),
+                    lambda s, f: asyncio.create_task(shutdown(dp))
+                )
+            except AttributeError:
+                pass
+        
+        # Запускаем бота
+        await site.start()
+        logger.info(f"Bot started on port {port}")
+        
+        # Ждем завершения
+        await asyncio.Event().wait()
+        
+    except Exception as e:
+        log_error(e, "Critical error in main")
+        if runner:
+            await runner.cleanup()
+        sys.exit(1)
+
+# Обработчики веб-хуков
+@log_execution
+async def process_update(request):
+    """Обработчик входящих обновлений от Telegram"""
+    try:
+        data = await request.json()
+        update = types.Update(**data)
+        await dp.feed_update(bot=bot, update=update)
+        return web.Response()
+    except Exception as e:
+        log_error(e, "Error processing update")
+        return web.Response(status=500)
+
+async def healthcheck(request):
+    """Простой обработчик для проверки работоспособности"""
+    return web.Response(text="Bot is running")
+
+@log_execution
+async def shutdown(dispatcher: Dispatcher):
+    """Корректное завершение работы бота"""
+    logger.info("Shutting down...")
+    
+    try:
+        # Отключаем планировщик
+        if scheduler:
+            scheduler.shutdown(wait=False)
+        
+        # Закрываем соединения
+        await dispatcher.storage.close()
+        await dispatcher.storage.wait_closed()
+        
+        # Закрываем сессию бота
+        session = await bot.get_session()
+        if session:
+            await session.close()
+        
+        # Останавливаем веб-приложение
+        if runner:
+            await runner.cleanup()
+            
+        logger.info("Shutdown completed successfully")
+    except Exception as e:
+        log_error(e, "Error during shutdown")
+
+@log_execution
+async def on_shutdown(app):
+    """Действия при завершении работы веб-приложения"""
+    logger.info("Stopping web application...")
+    await shutdown(dp)
+
+@log_execution
+async def on_startup(app):
+    """Действия при запуске"""
+    try:
+        webhook_path = f"/webhook/{TELEGRAM_BOT_TOKEN}"
+        webhook_url = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:8080') + webhook_path
+        
+        # Устанавливаем вебхук
+        await bot.set_webhook(
+            url=webhook_url,
+            drop_pending_updates=True
+        )
+        
+        # Устанавливаем команды бота
+        await bot.set_my_commands(COMMANDS)
+        logger.info(f"Webhook set to {webhook_url}")
+        logger.info("Bot commands updated successfully")
+    except Exception as e:
+        log_error(e, "Error during startup")
+        raise
+
+# Функция для отправки уведомлений о погоде
+@log_execution
+async def send_weather_alerts():
+    """Отправляет уведомления о погоде подписчикам"""
+    logger.info("Starting weather alerts check")
+    for user_id, subscriptions in weather_subscriptions.items():
+        for city, lat, lon in subscriptions:
+            try:
+                warnings = await check_weather_conditions(city, lat, lon)
+                if warnings:
+                    await bot.send_message(
+                        user_id,
+                        "⚠️ Предупреждения о погоде:\n" + "\n".join(warnings)
+                    )
+                    logger.info(f"Sent {len(warnings)} warnings to user {user_id} for {city}")
+            except Exception as e:
+                log_error(e, f"Error sending alert to user {user_id} for {city}")
+
+# Функция для отправки умных уведомлений
+@log_execution
+async def send_smart_notifications():
+    """Отправляет умные уведомления пользователям"""
+    logger.info("Starting smart notifications check")
+    current_hour = datetime.now().strftime('%H:00')
+    
+    for user_id, prefs in user_preferences.items():
+        if prefs['notification_time'] != current_hour:
+            continue
+            
+        try:
+            for city, lat, lon in weather_subscriptions[user_id]:
+                notifications = []
+                
+                # Проверяем условия для активностей
+                if prefs['activities']:
+                    activity_notice = await check_activity_conditions(city, lat, lon, prefs['activities'])
+                    if activity_notice:
+                        notifications.append(activity_notice)
+                
+                # Получаем текущую погоду
+                weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(weather_url) as response:
+                        weather_data = await check_api_response(response, "send_smart_notifications")
+                
+                temp = weather_data['main']['temp']
+                
+                # Проверяем температурный диапазон
+                if not (prefs['temp_range']['min'] <= temp <= prefs['temp_range']['max']):
+                    notifications.append(
+                        f"🌡 Температура в {city} ({temp:.1f}°C) вне вашего комфортного диапазона "
+                        f"({prefs['temp_range']['min']}°C - {prefs['temp_range']['max']}°C)"
+                    )
+                
+                # Проверяем ветер
+                wind_speed = weather_data['wind']['speed']
+                if wind_speed > prefs['wind_threshold']:
+                    notifications.append(f"💨 Сильный ветер в {city}: {wind_speed} м/с")
+                
+                # Проверяем дождь
+                if prefs['rain_alerts'] and 'rain' in weather_data:
+                    rain = weather_data['rain'].get('1h', 0)
+                    if rain > 0:
+                        notifications.append(f"🌧 Ожидается дождь в {city}: {rain} мм/ч")
+                
+                if notifications:
+                    await bot.send_message(
+                        user_id,
+                        "🔔 Умные уведомления:\n\n" + "\n\n".join(notifications)
+                    )
+                    logger.info(f"Sent {len(notifications)} smart notifications to user {user_id} for {city}")
+                    
+        except Exception as e:
+            log_error(e, f"Error sending smart notifications to user {user_id}")
+
+# Функция для проверки условий для активностей
+@log_execution
+async def check_activity_conditions(city, lat, lon, activities):
+    """Проверяет условия для активностей"""
+    try:
+        logger.info(f"Checking activity conditions for {city}")
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                weather_data = await check_api_response(response, "check_activity_conditions")
+        
+        temp = weather_data['main']['temp']
+        wind_speed = weather_data['wind']['speed']
+        is_rain = 'rain' in weather_data
+        
+        suitable_activities = []
+        
+        for activity in activities:
+            if activity not in ACTIVITIES:
+                continue
+                
+            conditions = ACTIVITIES[activity]
+            temp_min, temp_max = conditions['temp_range']
+            
+            if (temp_min <= temp <= temp_max and
+                wind_speed <= conditions['wind_max'] and
+                (not conditions['no_rain'] or not is_rain)):
+                suitable_activities.append(conditions['description'])
+        
+        if suitable_activities:
+            return f"🎯 Отличные условия в {city} для: {', '.join(suitable_activities)}!"
+        return None
+        
+    except Exception as e:
+        log_error(e, f"Error checking activity conditions for {city}")
+        return None
+
+async def main():
+    """Start the bot."""
+    global scheduler, app, runner
+    
+    try:
+        # Настраиваем логирование
+        logger.info("Starting bot initialization...")
+        
+        # Загружаем сохраненные данные
+        load_subscriptions()
+        load_user_preferences()
+        logger.info("Loaded saved data")
+        
+        # Инициализируем планировщик
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(send_weather_alerts, 'interval', minutes=30)
+        scheduler.add_job(send_smart_notifications, 'interval', minutes=60)
+        scheduler.start()
+        logger.info("Scheduler started")
+        
+        # Создаем веб-приложение
+        app = web.Application()
+        
+        # Добавляем обработчики
+        webhook_path = f"/webhook/{TELEGRAM_BOT_TOKEN}"
+        app.router.add_post(webhook_path, process_update)
+        app.router.add_get("/", healthcheck)
+        
+        # Добавляем обработчики событий приложения
+        app.on_startup.append(on_startup)
+        app.on_shutdown.append(on_shutdown)
+        
+        # Получаем порт из переменных окружения
+        port = int(os.environ.get('PORT', 8080))
+        
+        # Запускаем веб-сервер
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        
+        # Устанавливаем обработчики сигналов
+        for signal_name in ('SIGINT', 'SIGTERM'):
+            try:
+                signal.signal(
+                    getattr(signal, signal_name),
+                    lambda s, f: asyncio.create_task(shutdown(dp))
+                )
+            except AttributeError:
+                pass
+        
+        # Запускаем бота
+        await site.start()
+        logger.info(f"Bot started on port {port}")
+        
+        # Ждем завершения
+        await asyncio.Event().wait()
+        
+    except Exception as e:
+        log_error(e, "Critical error in main")
+        if runner:
+            await runner.cleanup()
+        sys.exit(1)
+
+# Обновим точку входа
+if __name__ == '__main__':
+    try:
+        # Запускаем бота в отдельной задаче
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Запускаем основной цикл с обработкой исключений
+        with suppress(KeyboardInterrupt, SystemExit):
+            loop.run_until_complete(main())
+    except Exception as e:
+        logging.error(f"Fatal error: {e}", exc_info=True)
+    finally:
+        # Закрываем loop
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        logging.info("Bot stopped")
+
+# Функция для проверки ответа API
+async def check_api_response(response, function_name):
+    """Проверяет ответ API на ошибки"""
+    if response.status != 200:
+        error_msg = f"API error in {function_name}: {response.status}"
+        logger.error(error_msg)
+        raise Exception(error_msg)
+    return await response.json()
+
+# Функция для проверки погодных условий
+@log_execution
+async def check_weather_conditions(city, lat, lon):
+    """Проверяет погодные условия и возвращает предупреждения"""
+    try:
+        logger.info(f"Checking weather conditions for {city}")
+        warnings = []
+        
+        # Получаем текущую погоду
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                weather_data = await check_api_response(response, "check_weather_conditions")
+        
+        # Проверяем температуру
+        temp = weather_data['main']['temp']
+        if temp > 30:
+            warnings.append(f"🌡 Высокая температура: {temp:.1f}°C")
+        elif temp < 0:
+            warnings.append(f"❄️ Низкая температура: {temp:.1f}°C")
+        
+        # Проверяем ветер
+        wind_speed = weather_data['wind']['speed']
+        if wind_speed > 10:
+            warnings.append(f"💨 Сильный ветер: {wind_speed} м/с")
+        
+        # Проверяем дождь
+        if 'rain' in weather_data:
+            rain = weather_data['rain'].get('1h', 0)
+            if rain > 0:
+                warnings.append(f"🌧 Ожидается дождь: {rain} мм/ч")
+        
+        # Проверяем снег
+        if 'snow' in weather_data:
+            snow = weather_data['snow'].get('1h', 0)
+            if snow > 0:
+                warnings.append(f"🌨 Ожидается снег: {snow} мм/ч")
+        
+        return warnings
+        
+    except Exception as e:
+        log_error(e, f"Error checking weather conditions for {city}")
+        return []
+
+@dp.message(Command('weather'))
+@log_execution
+async def weather_command(message: Message):
+    """Обработчик команды /weather"""
+    try:
+        # Проверяем, передано ли название города
+        try:
+            city = message.text.split(' ', 1)[1]
+        except IndexError:
+            await message.answer(
+                "Пожалуйста, укажите город после команды.\n"
+                "Например: /weather Москва"
+            )
+            return
+        
+        # Получаем координаты города
+        result = await get_city_coordinates(city)
+        if not result:
+            await message.answer(
+                "Извините, не могу найти такой город. Попробуйте:\n"
+                "1. Проверить правильность написания\n"
+                "2. Использовать название на русском или английском\n"
+                "3. Указать более точное название"
+            )
+            return
+            
+        lat, lon, city_name = result
+        
+        # Получаем текущую погоду
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                weather_data = await check_api_response(response, "weather_command")
+        
+        # Формируем ответ
+        weather_description = weather_data['weather'][0]['description'].capitalize()
+        temp = weather_data['main']['temp']
+        feels_like = weather_data['main']['feels_like']
+        humidity = weather_data['main']['humidity']
+        wind_speed = weather_data['wind']['speed']
+        
+        message_text = (
+            f"🌡 Погода в {city_name}:\n\n"
+            f"☁️ {weather_description}\n"
+            f"🌡 Температура: {temp:.1f}°C\n"
+            f"🤔 Ощущается как: {feels_like:.1f}°C\n"
+            f"💧 Влажность: {humidity}%\n"
+            f"💨 Ветер: {wind_speed} м/с\n"
+        )
+        
+        # Добавляем информацию об осадках
+        if 'rain' in weather_data:
+            rain = weather_data['rain'].get('1h', 0)
+            message_text += f"🌧 Дождь: {rain} мм/ч\n"
+        if 'snow' in weather_data:
+            snow = weather_data['snow'].get('1h', 0)
+            message_text += f"🌨 Снег: {snow} мм/ч\n"
+        
+        await message.answer(message_text)
+        logger.info(f"Weather info sent for {city_name}")
+        
+    except Exception as e:
+        log_error(e, f"Error in weather command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при получении погоды. Попробуйте позже.")
+
+@dp.message(Command('subscribe'))
+@log_execution
+async def subscribe_command(message: Message):
+    """Обработчик команды /subscribe"""
+    try:
+        user_id = message.from_user.id
+        
+        # Проверяем, передано ли название города
+        try:
+            city = message.text.split(' ', 1)[1]
+        except IndexError:
+            await message.answer(
+                "Пожалуйста, укажите город после команды.\n"
+                "Например: /subscribe Москва"
+            )
+            return
+        
+        # Получаем координаты города
+        result = await get_city_coordinates(city)
+        if not result:
+            await message.answer(
+                "Извините, не могу найти такой город. Попробуйте:\n"
+                "1. Проверить правильность написания\n"
+                "2. Использовать название на русском или английском\n"
+                "3. Указать более точное название"
+            )
+            return
+            
+        lat, lon, city_name = result
+        
+        # Проверяем, не подписан ли уже пользователь на этот город
+        if any(city_data[0].lower() == city_name.lower() for city_data in weather_subscriptions[user_id]):
+            await message.answer(f"Вы уже подписаны на погоду в городе {city_name}")
+            return
+        
+        # Добавляем подписку
+        weather_subscriptions[user_id].append([city_name, lat, lon])
+        save_subscriptions()
+        
+        # Создаем настройки по умолчанию, если их нет
+        if user_id not in user_preferences:
+            user_preferences[user_id] = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+            save_user_preferences()
+        
+        await message.answer(
+            f"✅ Вы успешно подписались на погоду в городе {city_name}\n\n"
+            "Теперь вы будете получать:\n"
+            "🌡 Уведомления об опасных погодных условиях\n"
+            "🎯 Рекомендации для активностей (если настроены)\n"
+            "📅 Ежедневный прогноз погоды\n\n"
+            "Используйте /preferences для настройки уведомлений"
+        )
+        logger.info(f"User {user_id} subscribed to {city_name}")
+        
+    except Exception as e:
+        log_error(e, f"Error in subscribe command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при подписке. Попробуйте позже.")
+
+@dp.message(Command('unsubscribe'))
+@log_execution
+async def unsubscribe_command(message: Message):
+    """Обработчик команды /unsubscribe"""
+    try:
+        user_id = message.from_user.id
+        
+        # Проверяем, передано ли название города
+        try:
+            city = message.text.split(' ', 1)[1]
+        except IndexError:
+            await message.answer(
+                "Пожалуйста, укажите город после команды.\n"
+                "Например: /unsubscribe Москва"
+            )
+            return
+        
+        # Проверяем, есть ли подписки у пользователя
+        if user_id not in weather_subscriptions or not weather_subscriptions[user_id]:
+            await message.answer("У вас нет активных подписок на погоду")
+            return
+        
+        # Ищем город в подписках
+        city_lower = city.lower()
+        for i, (subscribed_city, _, _) in enumerate(weather_subscriptions[user_id]):
+            if subscribed_city.lower() == city_lower:
+                weather_subscriptions[user_id].pop(i)
+                save_subscriptions()
+                await message.answer(f"✅ Вы успешно отписались от погоды в городе {subscribed_city}")
+                logger.info(f"User {user_id} unsubscribed from {subscribed_city}")
+                return
+        
+        await message.answer(f"Вы не подписаны на погоду в городе {city}")
+        
+    except Exception as e:
+        log_error(e, f"Error in unsubscribe command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при отписке. Попробуйте позже.")
 
 @dp.message(Command('stats'))
 async def stats_command(message: Message):
@@ -1386,12 +2541,18 @@ async def stats_command(message: Message):
         )
 
 @dp.message(Command('shelter'))
+@log_execution
 async def shelter_command(message: Message):
     """Поиск укрытия от непогоды"""
     try:
+        user_id = message.from_user.id
+        logger.info(f"Processing shelter command for user {user_id}")
+        
         # Проверяем, передано ли название города
         try:
             city = message.text.split(' ', 1)[1]
+            logger.info(f"Searching shelters for city: {city}")
+            
             # Получаем координаты города
             result = await get_city_coordinates(city)
             if not result:
@@ -1400,16 +2561,22 @@ async def shelter_command(message: Message):
                     "1. Проверить правильность написания\n"
                     "2. Использовать название на русском или английском\n"
                     "3. Указать более крупный город поблизости\n\n"
-                    "Или отправьте свою геолокацию, нажав на кнопку ниже 📍"
+                    "Или отправьте свою геолокацию, нажав на кнопку ниже 📍",
+                    reply_markup=ReplyKeyboardMarkup(
+                        keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
+                        resize_keyboard=True,
+                        one_time_keyboard=True
+                    )
                 )
                 return
+                
             lat, lon, normalized_city = result
+            logger.info(f"Found coordinates for {normalized_city}: {lat}, {lon}")
+            
         except IndexError:
             # Если город не указан, запрашиваем геолокацию
             keyboard = ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]
-                ],
+                keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
                 resize_keyboard=True,
                 one_time_keyboard=True
             )
@@ -1423,6 +2590,7 @@ async def shelter_command(message: Message):
         
         # Получаем список ближайших укрытий
         shelters = await find_nearby_shelters(lat, lon)
+        logger.info(f"Found {len(shelters)} shelters near {normalized_city}")
         
         if not shelters:
             await message.answer(
@@ -1432,7 +2600,10 @@ async def shelter_command(message: Message):
             return
         
         # Формируем сообщение с укрытиями
-        message_text = f"🏪 Ближайшие места, где можно укрыться от непогоды в районе {normalized_city if 'normalized_city' in locals() else 'вашей геолокации'}:\n\n"
+        message_text = f"🏪 Ближайшие места, где можно укрыться от непогоды в районе {normalized_city}:\n\n"
+        
+        # Создаем список кнопок для каждого укрытия
+        keyboard_buttons = []
         
         for place in shelters:
             distance = ((float(place['lat']) - lat) ** 2 + (float(place['lon']) - lon) ** 2) ** 0.5 * 111  # примерное расстояние в км
@@ -1445,398 +2616,372 @@ async def shelter_command(message: Message):
                 f"   🏠 Адрес: {address}\n\n"
             )
             
-            # Добавляем кнопку для открытия карты
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="🗺 Открыть на карте",
-                            url=f"https://www.openstreetmap.org/?mlat={place['lat']}&mlon={place['lon']}&zoom=17"
-                        )
-                    ]
-                ]
-            )
+            # Добавляем кнопку для этого места
+            keyboard_buttons.append([
+                InlineKeyboardButton(
+                    text=f"🗺 {name} на карте",
+                    url=f"https://www.openstreetmap.org/?mlat={place['lat']}&mlon={place['lon']}&zoom=17"
+                )
+            ])
         
+        # Создаем клавиатуру с кнопками для всех укрытий
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        
+        # Отправляем сообщение с информацией и кнопками
         await message.answer(message_text, reply_markup=keyboard)
+        logger.info(f"Successfully sent shelter information to user {user_id}")
         
     except Exception as e:
-        logging.error(f"Error in shelter_command: {e}")
+        log_error(e, f"Error in shelter_command for user {message.from_user.id}")
         await message.answer(
             "Извините, произошла ошибка при поиске укрытий. "
             "Пожалуйста, попробуйте позже."
         )
 
-def save_subscriptions():
-    """Сохраняет подписки в файл"""
-    with open('weather_subscriptions.json', 'w', encoding='utf-8') as f:
-        json.dump({str(k): v for k, v in weather_subscriptions.items()}, f, ensure_ascii=False)
-
-def load_subscriptions():
-    """Загружает подписки из файла"""
-    global weather_subscriptions
+@dp.message(Command('list'))
+@log_execution
+async def list_command(message: Message):
+    """Обработчик команды /list"""
     try:
-        if os.path.exists('weather_subscriptions.json'):
-            with open('weather_subscriptions.json', 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                weather_subscriptions = defaultdict(list, {int(k): v for k, v in data.items()})
-    except Exception as e:
-        logging.error(f"Error loading subscriptions: {e}")
-
-def save_user_preferences():
-    """Сохраняет настройки пользователей в файл"""
-    with open('user_preferences.json', 'w', encoding='utf-8') as f:
-        json.dump({str(k): v for k, v in user_preferences.items()}, f, ensure_ascii=False)
-
-def load_user_preferences():
-    """Загружает настройки пользователей из файла"""
-    global user_preferences
-    try:
-        if os.path.exists('user_preferences.json'):
-            with open('user_preferences.json', 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                user_preferences.update({int(k): v for k, v in data.items()})
-    except Exception as e:
-        logging.error(f"Error loading user preferences: {e}")
-
-async def check_weather_changes(city, lat, lon, prev_temp):
-    """Проверяет резкие изменения погоды"""
-    try:
-        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(weather_url) as response:
-                weather_data = await response.json()
+        user_id = message.from_user.id
         
-        curr_temp = weather_data['main']['temp']
-        temp_change = abs(curr_temp - prev_temp)
+        # Проверяем, есть ли подписки у пользователя
+        if user_id not in weather_subscriptions or not weather_subscriptions[user_id]:
+            await message.answer("У вас нет активных подписок на погоду")
+            return
         
-        if temp_change >= 5:  # Изменение на 5°C или более
-            return f"🌡 Резкое изменение температуры в {city}: {temp_change:.1f}°C"
-        return None
+        # Формируем список подписок
+        subscriptions = [f"🌍 {city}" for city, _, _ in weather_subscriptions[user_id]]
+        
+        await message.answer(
+            "Ваши подписки на погоду:\n\n" +
+            "\n".join(subscriptions) +
+            "\n\nИспользуйте /unsubscribe [город] для отписки"
+        )
+        logger.info(f"Subscriptions list sent to user {user_id}")
         
     except Exception as e:
-        logging.error(f"Error checking weather changes: {e}")
-        return None
-
-async def check_activity_conditions(city, lat, lon, activities):
-    """Проверяет условия для активностей"""
-    try:
-        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(weather_url) as response:
-                weather_data = await response.json()
-        
-        temp = weather_data['main']['temp']
-        wind_speed = weather_data['wind']['speed']
-        is_rain = 'rain' in weather_data
-        
-        suitable_activities = []
-        
-        for activity in activities:
-            if activity not in ACTIVITIES:
-                continue
-                
-            conditions = ACTIVITIES[activity]
-            temp_min, temp_max = conditions['temp_range']
-            
-            if (temp_min <= temp <= temp_max and
-                wind_speed <= conditions['wind_max'] and
-                (not conditions['no_rain'] or not is_rain)):
-                suitable_activities.append(conditions['description'])
-        
-        if suitable_activities:
-            return f"🎯 Отличные условия в {city} для: {', '.join(suitable_activities)}!"
-        return None
-        
-    except Exception as e:
-        logging.error(f"Error checking activity conditions: {e}")
-        return None
-
-async def send_smart_notifications():
-    """Отправляет умные уведомления пользователям"""
-    current_hour = datetime.now().strftime('%H:00')
-    
-    for user_id, prefs in user_preferences.items():
-        if prefs['notification_time'] != current_hour:
-            continue
-            
-        try:
-            for city, lat, lon in weather_subscriptions[user_id]:
-                notifications = []
-                
-                # Проверяем условия для активностей
-                if prefs['activities']:
-                    activity_notice = await check_activity_conditions(city, lat, lon, prefs['activities'])
-                    if activity_notice:
-                        notifications.append(activity_notice)
-                
-                # Получаем текущую погоду
-                weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(weather_url) as response:
-                        weather_data = await response.json()
-                
-                temp = weather_data['main']['temp']
-                
-                # Проверяем температурный диапазон
-                if not (prefs['temp_range']['min'] <= temp <= prefs['temp_range']['max']):
-                    notifications.append(
-                        f"🌡 Температура в {city} ({temp:.1f}°C) вне вашего комфортного диапазона "
-                        f"({prefs['temp_range']['min']}°C - {prefs['temp_range']['max']}°C)"
-                    )
-                
-                # Проверяем ветер
-                wind_speed = weather_data['wind']['speed']
-                if wind_speed > prefs['wind_threshold']:
-                    notifications.append(f"💨 Сильный ветер в {city}: {wind_speed} м/с")
-                
-                # Проверяем дождь
-                if prefs['rain_alerts'] and 'rain' in weather_data:
-                    rain = weather_data['rain'].get('1h', 0)
-                    if rain > 0:
-                        notifications.append(f"🌧 Ожидается дождь в {city}: {rain} мм/ч")
-                
-                if notifications:
-                    await bot.send_message(
-                        user_id,
-                        "🔔 Умные уведомления:\n\n" + "\n\n".join(notifications)
-                    )
-                    
-        except Exception as e:
-            logging.error(f"Error sending smart notifications to user {user_id}: {e}")
+        log_error(e, f"Error in list command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при получении списка подписок. Попробуйте позже.")
 
 @dp.message(Command('preferences'))
+@log_execution
 async def preferences_command(message: Message):
-    """Настройка предпочтений пользователя"""
-    user_id = message.from_user.id
-    
-    # Создаем клавиатуру с настройками
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🌡 Температурный диапазон",
-                    callback_data="set_temp_range"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🌧 Уведомления о дожде",
-                    callback_data="toggle_rain"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💨 Порог скорости ветра",
-                    callback_data="set_wind"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⚡️ Уведомления о резких изменениях",
-                    callback_data="toggle_changes"
-                )
-            ]
-        ]
-    )
-    
-    prefs = user_preferences[user_id]
-    await message.answer(
-        f"⚙️ Текущие настройки уведомлений:\n\n"
-        f"🌡 Комфортная температура: {prefs['temp_range']['min']}°C - {prefs['temp_range']['max']}°C\n"
-        f"🌧 Уведомления о дожде: {'Включены' if prefs['rain_alerts'] else 'Выключены'}\n"
-        f"💨 Порог ветра: {prefs['wind_threshold']} м/с\n"
-        f"⚡️ Уведомления об изменениях: {'Включены' if prefs['notify_changes'] else 'Выключены'}\n"
-        f"⏰ Время уведомлений: {prefs['notification_time']}\n\n"
-        f"Выберите настройку для изменения:",
-        reply_markup=keyboard
-    )
+    """Обработчик команды /preferences"""
+    try:
+        user_id = message.from_user.id
+        
+        # Проверяем, есть ли настройки у пользователя
+        if user_id not in user_preferences:
+            user_preferences[user_id] = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+            save_user_preferences()
+        
+        prefs = user_preferences[user_id]
+        
+        # Формируем клавиатуру
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏰ Время уведомлений", callback_data="pref_time")],
+            [InlineKeyboardButton(text="🌡 Диапазон температур", callback_data="pref_temp")],
+            [InlineKeyboardButton(text="💨 Порог ветра", callback_data="pref_wind")],
+            [InlineKeyboardButton(text="🌧 Уведомления о дожде", callback_data="pref_rain")],
+            [InlineKeyboardButton(text="🎯 Настройка активностей", callback_data="pref_activities")]
+        ])
+        
+        await message.answer(
+            "⚙️ Текущие настройки:\n\n"
+            f"⏰ Время уведомлений: {prefs['notification_time']}\n"
+            f"🌡 Комфортная температура: {prefs['temp_range']['min']}°C - {prefs['temp_range']['max']}°C\n"
+            f"💨 Уведомлять о ветре от: {prefs['wind_threshold']} м/с\n"
+            f"🌧 Уведомления о дожде: {'Включены' if prefs['rain_alerts'] else 'Выключены'}\n"
+            f"🎯 Активности: {', '.join(prefs['activities']) if prefs['activities'] else 'Не настроены'}\n\n"
+            "Выберите настройку для изменения:",
+            reply_markup=keyboard
+        )
+        logger.info(f"Preferences menu sent to user {user_id}")
+        
+    except Exception as e:
+        log_error(e, f"Error in preferences command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при получении настроек. Попробуйте позже.")
 
 @dp.message(Command('activities'))
+@log_execution
 async def activities_command(message: Message):
-    """Настройка предпочитаемых активностей"""
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🏃‍♂️ Бег",
-                    callback_data="toggle_activity_running"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🚴‍♂️ Велопрогулки",
-                    callback_data="toggle_activity_cycling"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🚶‍♂️ Прогулки",
-                    callback_data="toggle_activity_walking"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🧺 Пикник",
-                    callback_data="toggle_activity_picnic"
-                )
-            ]
-        ]
-    )
-    
-    user_id = message.from_user.id
-    current_activities = user_preferences[user_id]['activities']
-    
-    activities_text = "Нет выбранных активностей"
-    if current_activities:
-        activities_text = "\n".join(f"• {ACTIVITIES[act]['description']}" for act in current_activities)
-    
-    await message.answer(
-        f"🎯 Выберите интересующие вас активности, и я буду уведомлять "
-        f"вас когда погодные условия будут подходящими.\n\n"
-        f"Текущие активности:\n{activities_text}",
-        reply_markup=keyboard
-    )
-
-@dp.message(Command('notifytime'))
-async def notifytime_command(message: Message):
-    """Установка времени уведомлений"""
+    """Обработчик команды /activities"""
     try:
-        time_str = message.text.split(' ', 1)[1]
-        # Проверяем формат времени
+        user_id = message.from_user.id
+        
+        # Проверяем, есть ли настройки у пользователя
+        if user_id not in user_preferences:
+            user_preferences[user_id] = {
+                'notification_time': '09:00',
+                'temp_range': {'min': 15, 'max': 25},
+                'wind_threshold': 10,
+                'rain_alerts': True,
+                'activities': []
+            }
+            save_user_preferences()
+        
+        # Формируем клавиатуру с доступными активностями
+        keyboard = []
+        row = []
+        
+        for activity, info in ACTIVITIES.items():
+            is_selected = activity in user_preferences[user_id]['activities']
+            button = InlineKeyboardButton(
+                text=f"{'✅' if is_selected else '❌'} {info['description']}",
+                callback_data=f"activity_{activity}"
+            )
+            row.append(button)
+            
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        
+        if row:  # Добавляем оставшиеся кнопки
+            keyboard.append(row)
+        
+        keyboard.append([InlineKeyboardButton(text="✅ Готово", callback_data="activities_done")])
+        
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        await message.answer(
+            "🎯 Выберите интересующие вас активности:\n\n"
+            "Вы будете получать уведомления, когда погода благоприятна для выбранных занятий.\n"
+            "Нажмите на активность, чтобы включить/выключить её.",
+            reply_markup=markup
+        )
+        logger.info(f"Activities menu sent to user {user_id}")
+        
+    except Exception as e:
+        log_error(e, f"Error in activities command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при настройке активностей. Попробуйте позже.")
+
+@dp.message(Command('shelter'))
+@log_execution
+async def shelter_command(message: Message):
+    """Обработчик команды /shelter"""
+    try:
+        # Проверяем, передано ли название города
         try:
-            hour = int(time_str.split(':')[0])
-            if not (0 <= hour <= 23):
-                raise ValueError
-            new_time = f"{hour:02d}:00"
-        except:
+            city = message.text.split(' ', 1)[1]
+        except IndexError:
             await message.answer(
-                "Пожалуйста, укажите время в формате ЧЧ:00\n"
-                "Например: /notifytime 09:00"
+                "Пожалуйста, укажите город после команды.\n"
+                "Например: /shelter Москва"
             )
             return
         
-        user_id = message.from_user.id
-        user_preferences[user_id]['notification_time'] = new_time
-        save_user_preferences()
+        # Получаем координаты города
+        result = await get_city_coordinates(city)
+        if not result:
+            await message.answer(
+                "Извините, не могу найти такой город. Попробуйте:\n"
+                "1. Проверить правильность написания\n"
+                "2. Использовать название на русском или английском\n"
+                "3. Указать более точное название"
+            )
+            return
+            
+        lat, lon, city_name = result
         
-        await message.answer(f"✅ Время уведомлений установлено на {new_time}")
+        # Ищем ближайшие укрытия
+        places_url = f"https://api.openweathermap.org/data/2.5/find?lat={lat}&lon={lon}&cnt=5&appid={OPENWEATHER_API_KEY}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(places_url) as response:
+                places_data = await check_api_response(response, "shelter_command")
         
-    except IndexError:
-        await message.answer(
-            "Пожалуйста, укажите время после команды.\n"
-            "Например: /notifytime 09:00"
-        )
-
-@dp.callback_query(lambda c: c.data.startswith('toggle_activity_'))
-async def process_activity_toggle(callback_query: types.CallbackQuery):
-    """Обработка переключения активностей"""
-    activity = callback_query.data.replace('toggle_activity_', '')
-    user_id = callback_query.from_user.id
-    
-    if activity in user_preferences[user_id]['activities']:
-        user_preferences[user_id]['activities'].remove(activity)
-        status = 'удалена из'
-    else:
-        user_preferences[user_id]['activities'].append(activity)
-        status = 'добавлена в'
-    
-    save_user_preferences()
-    
-    await callback_query.answer(
-        f"Активность {ACTIVITIES[activity]['description']} {status} список"
-    )
-    
-    # Обновляем сообщение с текущим списком активностей
-    current_activities = user_preferences[user_id]['activities']
-    activities_text = "Нет выбранных активностей"
-    if current_activities:
-        activities_text = "\n".join(f"• {ACTIVITIES[act]['description']}" for act in current_activities)
-    
-    await callback_query.message.edit_text(
-        f"🎯 Выберите интересующие вас активности, и я буду уведомлять "
-        f"вас когда погодные условия будут подходящими.\n\n"
-        f"Текущие активности:\n{activities_text}",
-        reply_markup=callback_query.message.reply_markup
-    )
-
-async def main():
-    """Start the bot."""
-    global scheduler, app, runner
-    
-    try:
-        # Настраиваем логирование
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
+        # Формируем список укрытий
+        shelters = []
+        for place in places_data['list']:
+            if place['name'] != city_name:  # Исключаем текущий город
+                distance = calculate_distance(lat, lon, place['coord']['lat'], place['coord']['lon'])
+                if distance <= 50:  # Только места в радиусе 50 км
+                    weather = place['weather'][0]['description']
+                    temp = place['main']['temp'] - 273.15  # Конвертируем из Кельвинов в Цельсии
+                    shelters.append({
+                        'name': place['name'],
+                        'distance': distance,
+                        'weather': weather,
+                        'temp': temp
+                    })
         
-        # Загружаем сохраненные данные
-        load_subscriptions()
-        load_user_preferences()
+        if not shelters:
+            await message.answer(
+                f"🏘 К сожалению, не удалось найти подходящих укрытий рядом с {city_name}.\n"
+                "Попробуйте поискать укрытие в другом городе."
+            )
+            return
         
-        # Инициализируем планировщик
-        scheduler = AsyncIOScheduler()
-        scheduler.add_job(send_weather_alerts, 'interval', minutes=30)
-        scheduler.add_job(send_smart_notifications, 'interval', minutes=60)
-        scheduler.start()
+        # Сортируем укрытия по расстоянию
+        shelters.sort(key=lambda x: x['distance'])
         
-        # Создаем веб-приложение
-        app = web.Application()
+        # Формируем ответ
+        message_text = f"🏘 Ближайшие укрытия от непогоды рядом с {city_name}:\n\n"
+        for shelter in shelters:
+            message_text += (
+                f"🏡 {shelter['name']}\n"
+                f"📍 Расстояние: {shelter['distance']:.1f} км\n"
+                f"☁️ Погода: {shelter['weather']}\n"
+                f"🌡 Температура: {shelter['temp']:.1f}°C\n\n"
+            )
         
-        # Добавляем обработчики
-        webhook_path = f"/webhook/{TELEGRAM_BOT_TOKEN}"
-        app.router.add_post(webhook_path, process_update)
-        app.router.add_get("/", healthcheck)
-        
-        # Добавляем обработчики событий приложения
-        app.on_startup.append(on_startup)
-        app.on_shutdown.append(on_shutdown)
-        
-        # Получаем порт из переменных окружения
-        port = int(os.environ.get('PORT', 8080))
-        
-        # Запускаем веб-сервер
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        
-        # Устанавливаем обработчики сигналов
-        for signal_name in ('SIGINT', 'SIGTERM'):
-            try:
-                signal.signal(
-                    getattr(signal, signal_name),
-                    lambda s, f: asyncio.create_task(shutdown(dp))
-                )
-            except AttributeError:
-                pass
-        
-        # Запускаем бота
-        await site.start()
-        logging.info(f"Bot started on port {port}")
-        
-        # Ждем завершения
-        await asyncio.Event().wait()
+        await message.answer(message_text)
+        logger.info(f"Shelter info sent for {city_name}")
         
     except Exception as e:
-        logging.error(f"Critical error in main: {e}", exc_info=True)
-        if runner:
-            await runner.cleanup()
-        sys.exit(1)
+        log_error(e, f"Error in shelter command for user {message.from_user.id}")
+        await message.answer("😔 Произошла ошибка при поиске укрытий. Попробуйте позже.")
 
-# Обновим точку входа
-if __name__ == '__main__':
+# Database configuration
+DB_FILE = 'weather_bot.db'
+
+@contextmanager
+def get_db():
+    """Context manager для работы с базой данных"""
+    conn = sqlite3.connect(DB_FILE)
     try:
-        # Запускаем бота в отдельной задаче
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Запускаем основной цикл с обработкой исключений
-        with suppress(KeyboardInterrupt, SystemExit):
-            loop.run_until_complete(main())
+        yield conn
+        conn.commit()
     except Exception as e:
-        logging.error(f"Fatal error: {e}", exc_info=True)
+        conn.rollback()
+        raise
     finally:
-        # Закрываем loop
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
-        logging.info("Bot stopped")
+        conn.close()
+
+def init_db():
+    """Инициализация базы данных"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # Создаем таблицу подписок
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id INTEGER,
+                city TEXT,
+                lat REAL,
+                lon REAL,
+                PRIMARY KEY (user_id, city)
+            )
+        ''')
+        
+        # Создаем таблицу настроек пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id INTEGER PRIMARY KEY,
+                notification_time TEXT,
+                temp_min INTEGER,
+                temp_max INTEGER,
+                wind_threshold INTEGER,
+                rain_alerts BOOLEAN,
+                activities TEXT
+            )
+        ''')
+        
+        # Создаем таблицу статистики погоды
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS weather_stats (
+                city TEXT,
+                timestamp INTEGER,
+                temperature REAL,
+                humidity INTEGER,
+                wind_speed REAL,
+                PRIMARY KEY (city, timestamp)
+            )
+        ''')
+        
+        conn.commit()
+        logger.info("Database initialized successfully")
+
+def save_subscription(user_id: int, city: str, lat: float, lon: float):
+    """Сохраняет подписку в базу данных"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT OR REPLACE INTO subscriptions (user_id, city, lat, lon) VALUES (?, ?, ?, ?)',
+            (user_id, city, lat, lon)
+        )
+
+def get_user_subscriptions(user_id: int) -> list:
+    """Получает список подписок пользователя"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT city, lat, lon FROM subscriptions WHERE user_id = ?', (user_id,))
+        return cursor.fetchall()
+
+def save_user_preferences_db(user_id: int, preferences: dict):
+    """Сохраняет настройки пользователя в базу данных"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT OR REPLACE INTO user_preferences 
+               (user_id, notification_time, temp_min, temp_max, wind_threshold, rain_alerts, activities)
+               VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (
+                user_id,
+                preferences['notification_time'],
+                preferences['temp_range']['min'],
+                preferences['temp_range']['max'],
+                preferences['wind_threshold'],
+                preferences['rain_alerts'],
+                json.dumps(preferences['activities'])
+            )
+        )
+
+def get_user_preferences_db(user_id: int) -> dict:
+    """Получает настройки пользователя из базы данных"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM user_preferences WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        
+        if row:
+            return {
+                'notification_time': row[1],
+                'temp_range': {'min': row[2], 'max': row[3]},
+                'wind_threshold': row[4],
+                'rain_alerts': bool(row[5]),
+                'activities': json.loads(row[6])
+            }
+        return None
+
+def save_weather_stats(city: str, temp: float, humidity: int, wind_speed: float):
+    """Сохраняет статистику погоды"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        timestamp = int(time_module.time())
+        cursor.execute(
+            'INSERT INTO weather_stats (city, timestamp, temperature, humidity, wind_speed) VALUES (?, ?, ?, ?, ?)',
+            (city, timestamp, temp, humidity, wind_speed)
+        )
+
+def get_weather_stats(city: str, hours: int = 24) -> dict:
+    """Получает статистику погоды за указанный период"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        timestamp = int(time_module.time() - hours * 3600)
+        cursor.execute(
+            '''SELECT AVG(temperature), MIN(temperature), MAX(temperature), AVG(humidity), AVG(wind_speed)
+               FROM weather_stats 
+               WHERE city = ? AND timestamp > ?''',
+            (city, timestamp)
+        )
+        row = cursor.fetchone()
+        
+        if row and row[0] is not None:
+            return {
+                'temp_avg': row[0],
+                'temp_min': row[1],
+                'temp_max': row[2],
+                'humidity_avg': row[3],
+                'wind_speed_avg': row[4]
+            }
+        return None
+
+# Инициализируем базу данных при запуске
+init_db()
