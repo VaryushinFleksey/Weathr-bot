@@ -36,4 +36,8 @@ ENV/
 config.py
 
 # Other
-.DS_Store 
+.DS_Store
+
+# Database
+*.db
+*.pyc 

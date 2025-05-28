@@ -2079,7 +2079,10 @@ async def on_startup(app):
     """Действия при запуске"""
     try:
         webhook_path = f"/webhook/{TELEGRAM_BOT_TOKEN}"
-        webhook_url = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:8080') + webhook_path
+        webhook_url = os.environ.get('RENDER_EXTERNAL_URL')
+        if not webhook_url:
+            raise ValueError("RENDER_EXTERNAL_URL environment variable is not set")
+        webhook_url = webhook_url + webhook_path
         
         # Устанавливаем вебхук
         await bot.set_webhook(
@@ -2956,18 +2959,29 @@ init_db()
 
 # Добавляем функцию для сохранения информации о пользователе
 def save_user_info(user: types.User):
-    """Сохраняет или обновляет информацию о пользователе"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO users 
-            (user_id, username, first_name, last_name, language_code, is_premium)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (
-            user.id,
-            user.username,
-            user.first_name,
-            user.last_name,
-            user.language_code,
-            getattr(user, 'is_premium', False)
-        ))
+    """Сохраняет информацию о пользователе в базу данных"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO users (
+                    user_id, username, first_name, last_name,
+                    language_code, is_premium, joined_at
+                ) VALUES (?, ?, ?, ?, ?, ?, COALESCE(
+                    (SELECT joined_at FROM users WHERE user_id = ?),
+                    CURRENT_TIMESTAMP
+                ))
+            ''', (
+                user.id,
+                user.username,
+                user.first_name,
+                user.last_name,
+                user.language_code,
+                user.is_premium,
+                user.id
+            ))
+            conn.commit()
+            logger.info(f"User info saved: {user.id} ({user.username or user.first_name})")
+    except Exception as e:
+        log_error(e, f"Error saving user info for user {user.id}")
+        raise
