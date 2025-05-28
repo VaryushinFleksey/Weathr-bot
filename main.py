@@ -391,22 +391,34 @@ def check_weather_alerts(weather_data):
 async def start_command(message: Message):
     """Обработчик команды /start"""
     try:
-        user_id = message.from_user.id
-        user_name = message.from_user.first_name
+        user = message.from_user
+        user_id = user.id
+        user_name = user.first_name
+        
+        # Сохраняем информацию о пользователе
+        save_user_info(user)
         
         # Создаем настройки по умолчанию для нового пользователя
-        if user_id not in user_preferences:
-            user_preferences[user_id] = {
+        prefs = get_user_preferences_db(user_id)
+        if not prefs:
+            default_prefs = {
                 'notification_time': '09:00',
                 'temp_range': {'min': 15, 'max': 25},
                 'wind_threshold': 10,
                 'rain_alerts': True,
                 'activities': []
             }
-            save_user_preferences()
+            save_user_preferences_db(user_id, default_prefs)
+        
+        # Получаем информацию о пользователе из базы данных
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT joined_at FROM users WHERE user_id = ?', (user_id,))
+            joined_at = cursor.fetchone()[0]
         
         await message.answer(
             f"👋 Привет, {user_name}!\n\n"
+            f"Вы с нами с: {joined_at}\n\n"
             "Я бот погоды с умными уведомлениями. Вот что я умею:\n\n"
             "🌤 /weather [город] - текущая погода\n"
             "🔔 /subscribe [город] - подписка на уведомления\n"
@@ -417,7 +429,7 @@ async def start_command(message: Message):
             "🏘 /shelter [город] - найти укрытие от непогоды\n\n"
             "Используйте эти команды для управления подписками и настройками."
         )
-        logger.info(f"New user started bot: {user_id} ({user_name})")
+        logger.info(f"User interaction: {user_id} ({user_name}) used /start command")
     except Exception as e:
         log_error(e, f"Error in start command for user {message.from_user.id}")
         await message.answer("😔 Произошла ошибка при обработке команды. Попробуйте позже.")
@@ -2810,6 +2822,19 @@ def init_db():
     with get_db() as conn:
         cursor = conn.cursor()
         
+        # Создаем таблицу пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                language_code TEXT,
+                is_premium BOOLEAN,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
         # Создаем таблицу подписок
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -2936,3 +2961,21 @@ def get_weather_stats(city: str, hours: int = 24) -> dict:
 
 # Инициализируем базу данных при запуске
 init_db()
+
+# Добавляем функцию для сохранения информации о пользователе
+def save_user_info(user: types.User):
+    """Сохраняет или обновляет информацию о пользователе"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO users 
+            (user_id, username, first_name, last_name, language_code, is_premium)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            user.id,
+            user.username,
+            user.first_name,
+            user.last_name,
+            user.language_code,
+            getattr(user, 'is_premium', False)
+        ))
