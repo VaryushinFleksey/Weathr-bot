@@ -539,22 +539,32 @@ async def get_weather(message: Message):
             "Пожалуйста, попробуйте позже."
         )
 
-async def healthcheck():
+async def healthcheck(request):
     """Простой обработчик для проверки работоспособности"""
     return web.Response(text="Bot is running")
 
 async def on_shutdown(app):
     """Корректное завершение работы бота"""
     print("Shutting down...")
-    await bot.session.close()
-    await dp.storage.close()
-    await dp.stop_polling()
+    try:
+        await bot.session.close()
+        await dp.storage.close()
+        await dp.stop_polling()
+    except Exception as e:
+        print(f"Error during shutdown: {e}")
 
 async def main():
     """Start the bot."""
     try:
-        # Удаляем вебхук и старые обновления
+        # Принудительно удаляем все предыдущие обновления и вебхук
+        print("Removing webhook...")
         await bot.delete_webhook(drop_pending_updates=True)
+        
+        # Очищаем все обновления перед стартом
+        print("Skipping pending updates...")
+        await bot.get_updates(offset=-1)
+        
+        # Устанавливаем команды бота
         await bot.set_my_commands(COMMANDS)
         print("Bot commands updated successfully")
         
@@ -573,11 +583,13 @@ async def main():
         await site.start()
         print(f"Web server is running on port {port}")
         
-        # Запускаем бота в режиме polling с таймаутом
+        # Запускаем бота в режиме polling с таймаутом и защитой от конфликтов
         print("Starting bot polling...")
         await dp.start_polling(bot, 
                              allowed_updates=dp.resolve_used_update_types(),
-                             polling_timeout=30)
+                             polling_timeout=30,
+                             skip_updates=True,  # Пропускаем обновления при старте
+                             reset_webhook=True)  # Сбрасываем вебхук при старте
         
     except Exception as e:
         print(f"Error: {e}")
@@ -593,6 +605,8 @@ if __name__ == '__main__':
             if hasattr(signal, signal_name):
                 signal.signal(getattr(signal, signal_name), lambda s, f: asyncio.get_event_loop().stop())
         
+        # Запускаем бота
+        print("Starting bot...")
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print('Bot stopped')
