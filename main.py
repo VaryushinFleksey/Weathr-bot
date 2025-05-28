@@ -6,13 +6,16 @@ from aiogram.types import Message, BotCommand, ReplyKeyboardMarkup, KeyboardButt
 import requests
 from dotenv import load_dotenv
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import signal
 import sys
 from aiohttp import web
 import aiohttp
 import math
+import json
+from collections import defaultdict
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Load environment variables
 load_dotenv()
@@ -41,8 +44,16 @@ COMMANDS = [
     BotCommand(command='compare', description='Сравнить погоду в двух городах'),
     BotCommand(command='alerts', description='Погодные предупреждения'),
     BotCommand(command='wear', description='Рекомендации по одежде'),
-    BotCommand(command='rain', description='Карта осадков')
+    BotCommand(command='rain', description='Карта осадков'),
+    BotCommand(command='subscribe', description='Подписаться на уведомления о погоде'),
+    BotCommand(command='unsubscribe', description='Отписаться от уведомлений'),
+    BotCommand(command='stats', description='Статистика погоды'),
+    BotCommand(command='shelter', description='Найти укрытие от непогоды')
 ]
+
+# Добавим глобальные переменные для хранения подписок и статистики
+weather_subscriptions = defaultdict(list)  # {user_id: [(city, lat, lon), ...]}
+weather_stats = defaultdict(lambda: defaultdict(list))  # {city: {'temp': [], 'humidity': [], ...}}
 
 def get_clothing_recommendations(weather_data):
     """Формирует рекомендации по одежде на основе погодных условий"""
@@ -269,7 +280,11 @@ async def start_command(message: Message):
         '6. Сравнить погоду в разных городах (/compare)\n'
         '7. Показать погодные предупреждения (/alerts город)\n'
         '8. Получить рекомендации по одежде (/wear город)\n'
-        '9. Получить карту осадков (/rain город)\n\n'
+        '9. Получить карту осадков (/rain город)\n'
+        '10. Подписаться на уведомления о погоде (/subscribe город)\n'
+        '11. Отписаться от уведомлений (/unsubscribe город)\n'
+        '12. Получить статистику погоды (/stats город)\n'
+        '13. Найти укрытие от непогоды (/shelter)\n\n'
         'Используйте кнопку ниже, чтобы отправить свою геолокацию!',
         reply_markup=create_main_keyboard()
     )
@@ -287,7 +302,11 @@ async def help_command(message: Message):
         '6. /alerts ГОРОД - погодные предупреждения\n'
         '7. /wear ГОРОД - рекомендации по одежде\n'
         '8. /rain ГОРОД - карта осадков\n'
-        '9. Нажмите кнопку "📍 Отправить геолокацию" для погоды в вашем месте\n\n'
+        '9. /subscribe ГОРОД - подписаться на уведомления о погоде\n'
+        '10. /unsubscribe ГОРОД - отписаться от уведомлений\n'
+        '11. /stats ГОРОД - статистика погоды\n'
+        '12. /shelter - найти укрытие от непогоды\n'
+        '13. Нажмите кнопку "📍 Отправить геолокацию" для погоды в вашем месте\n\n'
         'Примеры:\n'
         '- "Москва" - текущая погода\n'
         '- "/forecast Париж" - прогноз на 5 дней\n'
@@ -342,9 +361,111 @@ async def detailed_command(message: Message):
             "Пожалуйста, попробуйте позже."
         )
 
+def get_air_quality_recommendations(aqi, components):
+    """Возвращает рекомендации на основе качества воздуха"""
+    recommendations = []
+    
+    # Общие рекомендации на основе AQI
+    aqi_recommendations = {
+        1: [
+            "✅ Отличное качество воздуха - идеально для любой активности на улице",
+            "🏃‍♂️ Прекрасное время для спорта на свежем воздухе",
+            "🌳 Можно долго гулять и наслаждаться свежим воздухом"
+        ],
+        2: [
+            "✅ Хорошее качество воздуха - подходит для большинства людей",
+            "⚠️ Людям с повышенной чувствительностью следует ограничить длительные нагрузки",
+            "🏃‍♂️ Можно заниматься спортом на улице"
+        ],
+        3: [
+            "⚠️ Умеренное загрязнение - следует быть осторожным",
+            "😷 Чувствительным группам лучше ограничить пребывание на улице",
+            "🏃‍♂️ Сократите интенсивные физические нагрузки на открытом воздухе"
+        ],
+        4: [
+            "❗ Плохое качество воздуха - примите меры предосторожности",
+            "😷 Рекомендуется носить маску при выходе на улицу",
+            "🏠 По возможности оставайтесь в помещении",
+            "🚗 Держите окна в машине закрытыми"
+        ],
+        5: [
+            "⛔ Очень плохое качество воздуха - серьезный риск для здоровья",
+            "🏠 Настоятельно рекомендуется оставаться в помещении",
+            "😷 При необходимости выхода используйте респиратор",
+            "❗ Избегайте любой физической активности на улице"
+        ]
+    }
+    
+    recommendations.extend(aqi_recommendations.get(aqi, []))
+    
+    # Специфические рекомендации на основе компонентов
+    if components['pm2_5'] > 25:  # WHO guideline value
+        recommendations.append("😷 Высокий уровень мелких частиц PM2.5 - используйте маску с хорошей фильтрацией")
+    
+    if components['pm10'] > 50:  # WHO guideline value
+        recommendations.append("😷 Повышенный уровень крупных частиц PM10 - избегайте пыльных мест")
+    
+    if components['o3'] > 100:  # High ozone level
+        recommendations.append("⚠️ Высокий уровень озона - избегайте активности на улице в жаркое время дня")
+    
+    if components['no2'] > 200:  # High NO2 level
+        recommendations.append("🏭 Высокий уровень диоксида азота - держитесь подальше от оживленных дорог")
+    
+    if components['so2'] > 350:  # High SO2 level
+        recommendations.append("⚠️ Высокий уровень диоксида серы - может вызывать респираторные проблемы")
+    
+    return recommendations
+
+def format_air_quality_message(city, air_data):
+    """Форматирует сообщение о качестве воздуха"""
+    aqi = air_data['list'][0]['main']['aqi']
+    components = air_data['list'][0]['components']
+    
+    # AQI levels description
+    aqi_levels = {
+        1: "Отличное 🌟",
+        2: "Хорошее 🌿",
+        3: "Умеренное 😐",
+        4: "Плохое 😷",
+        5: "Очень плохое ⚠️"
+    }
+    
+    # Компоненты и их описания
+    components_info = {
+        'co': ('CO', 'Угарный газ', 'мкг/м³'),
+        'no': ('NO', 'Оксид азота', 'мкг/м³'),
+        'no2': ('NO₂', 'Диоксид азота', 'мкг/м³'),
+        'o3': ('O₃', 'Озон', 'мкг/м³'),
+        'so2': ('SO₂', 'Диоксид серы', 'мкг/м³'),
+        'pm2_5': ('PM2.5', 'Мелкие частицы', 'мкг/м³'),
+        'pm10': ('PM10', 'Крупные частицы', 'мкг/м³'),
+        'nh3': ('NH₃', 'Аммиак', 'мкг/м³')
+    }
+    
+    # Формируем основное сообщение
+    message = [
+        f"🌬 Качество воздуха в {city}:",
+        f"\n📊 Общий индекс: {aqi_levels[aqi]}",
+        "\n📈 Компоненты воздуха:"
+    ]
+    
+    # Добавляем информацию о компонентах
+    for code, (symbol, name, unit) in components_info.items():
+        if code in components:
+            value = components[code]
+            message.append(f"• {symbol} ({name}): {value:.1f} {unit}")
+    
+    # Получаем и добавляем рекомендации
+    recommendations = get_air_quality_recommendations(aqi, components)
+    if recommendations:
+        message.append("\n💡 Рекомендации:")
+        message.extend(recommendations)
+    
+    return "\n".join(message)
+
 @dp.message(Command('air'))
 async def air_quality_command(message: Message):
-    """Get air quality information for the specified city."""
+    """Получает информацию о качестве воздуха для указанного города"""
     try:
         city = message.text.split(' ', 1)[1]
     except IndexError:
@@ -355,10 +476,11 @@ async def air_quality_command(message: Message):
         return
 
     try:
-        # Get coordinates first
+        # Получаем координаты
         geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
-        geo_response = requests.get(geo_url)
-        geo_data = geo_response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(geo_url) as response:
+                geo_data = await response.json()
         
         if not geo_data:
             await message.answer("Извините, не могу найти такой город. Попробуйте другой.")
@@ -367,37 +489,30 @@ async def air_quality_command(message: Message):
         lat = geo_data[0]['lat']
         lon = geo_data[0]['lon']
         
-        # Get air quality data
+        # Получаем данные о качестве воздуха
         air_url = f"http://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}"
-        air_response = requests.get(air_url)
-        air_data = air_response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(air_url) as response:
+                air_data = await response.json()
         
-        # AQI levels description
-        aqi_levels = {
-            1: "Отличное ",
-            2: "Хорошее 🙂",
-            3: "Умеренное 😐",
-            4: "Плохое 😷",
-            5: "Очень плохое 🤢"
-        }
-        
-        aqi = air_data['list'][0]['main']['aqi']
-        components = air_data['list'][0]['components']
-        
-        air_message = (
-            f"🌬 Качество воздуха в городе {city}:\n\n"
-            f"Общий индекс: {aqi_levels[aqi]}\n\n"
-            f"Компоненты:\n"
-            f"CO (Угарный газ): {components['co']:.1f} мкг/м³\n"
-            f"NO (Оксид азота): {components['no']:.1f} мкг/м³\n"
-            f"NO₂ (Диоксид азота): {components['no2']:.1f} мкг/м³\n"
-            f"O₃ (Озон): {components['o3']:.1f} мкг/м³\n"
-            f"SO₂ (Диоксид серы): {components['so2']:.1f} мкг/м³\n"
-            f"PM2.5 (Мелкие частицы): {components['pm2_5']:.1f} мкг/м³\n"
-            f"PM10 (Крупные частицы): {components['pm10']:.1f} мкг/м³"
-        )
-        
+        # Форматируем и отправляем сообщение
+        air_message = format_air_quality_message(city, air_data)
         await message.answer(air_message)
+        
+        # Если качество воздуха плохое, предлагаем посмотреть прогноз
+        if air_data['list'][0]['main']['aqi'] >= 4:
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="Посмотреть прогноз загрязнения",
+                        callback_data=f"air_forecast_{lat}_{lon}"
+                    )
+                ]]
+            )
+            await message.answer(
+                "❗ Обнаружен высокий уровень загрязнения. Хотите посмотреть прогноз?",
+                reply_markup=keyboard
+            )
         
     except Exception as e:
         logging.error(f"Error getting air quality: {e}")
@@ -406,129 +521,44 @@ async def air_quality_command(message: Message):
             "Пожалуйста, попробуйте позже."
         )
 
-async def get_location_info(lat, lon):
-    """Получает подробную информацию о местоположении"""
+@dp.callback_query(lambda c: c.data.startswith('air_forecast_'))
+async def air_forecast(callback_query: types.CallbackQuery):
+    """Показывает прогноз качества воздуха"""
     try:
-        # Получаем информацию о местоположении через reverse geocoding
-        reverse_url = f"http://api.openweathermap.org/geo/1.0/reverse?lat={lat}&lon={lon}&limit=1&appid={OPENWEATHER_API_KEY}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(reverse_url) as response:
-                location_data = await response.json()
-                
-        if not location_data:
-            return "Неизвестное место"
-            
-        # Формируем название места
-        location = location_data[0]
-        place_name = []
-        
-        if 'local_names' in location and 'ru' in location['local_names']:
-            place_name.append(location['local_names']['ru'])
-        else:
-            place_name.append(location.get('name', ''))
-            
-        if location.get('state'):
-            if 'local_names' in location and 'ru' in location['local_names']:
-                place_name.append(location['local_names']['ru'])
-            else:
-                place_name.append(location['state'])
-                
-        if location.get('country'):
-            place_name.append(location['country'])
-            
-        return ", ".join(filter(None, place_name))
-    except Exception as e:
-        logging.error(f"Error getting location info: {e}")
-        return "Неизвестное место"
-
-@dp.message(lambda message: message.location is not None)
-async def handle_location(message: Message):
-    """Обработка полученной геолокации"""
-    try:
-        lat = message.location.latitude
-        lon = message.location.longitude
-        
-        # Получаем название места
-        location_name = await get_location_info(lat, lon)
-        
-        # Получаем погодные данные
-        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(weather_url) as response:
-                if response.status != 200:
-                    await message.answer(
-                        "Извините, не удалось получить данные о погоде. "
-                        "Пожалуйста, попробуйте позже."
-                    )
-                    return
-                weather_data = await response.json()
-        
-        # Проверяем наличие предупреждений
-        alerts = check_weather_alerts(weather_data)
-        
-        # Форматируем сообщение с информацией о местоположении
-        response_message = f"📍 Определено местоположение: {location_name}\n\n"
-        response_message += format_detailed_weather(weather_data, location_name)
-        
-        if alerts:
-            response_message += "\n\n⚠️ Предупреждения:\n" + "\n".join(alerts)
-        
-        # Отправляем ответ с информацией о погоде
-        await message.answer(response_message)
-        
-        # Если есть осадки, предлагаем посмотреть карту
-        if 'rain' in weather_data or 'snow' in weather_data:
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[[
-                    InlineKeyboardButton(
-                        text="Показать карту осадков",
-                        callback_data=f"show_rain_map_{lat}_{lon}"
-                    )
-                ]]
-            )
-            await message.answer(
-                "Хотите посмотреть карту осадков для вашего местоположения?",
-                reply_markup=keyboard
-            )
-        
-    except Exception as e:
-        logging.error(f"Error handling location: {e}")
-        await message.answer(
-            "Извините, произошла ошибка при определении местоположения. "
-            "Пожалуйста, попробуйте позже или введите название города вручную."
-        )
-
-# Добавляем обработчик для кнопки показа карты осадков
-@dp.callback_query(lambda c: c.data.startswith('show_rain_map_'))
-async def show_rain_map(callback_query: types.CallbackQuery):
-    """Показывает карту осадков для сохраненных координат"""
-    try:
-        # Извлекаем координаты из callback_data
+        # Извлекаем координаты
         _, lat, lon = callback_query.data.split('_')[2:]
         lat, lon = float(lat), float(lon)
         
-        # Получаем название места
-        location_name = await get_location_info(lat, lon)
+        # Получаем прогноз качества воздуха
+        forecast_url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(forecast_url) as response:
+                forecast_data = await response.json()
         
-        # Получаем карту осадков
-        map_url = await get_precipitation_map(lat, lon)
+        # Анализируем прогноз
+        forecasts = forecast_data['list'][:8]  # Берем прогноз на ближайшие 24 часа
+        aqi_levels = {
+            1: "Отличное 🌟",
+            2: "Хорошее 🌿",
+            3: "Умеренное 😐",
+            4: "Плохое 😷",
+            5: "Очень плохое ⚠️"
+        }
         
-        if map_url:
-            await callback_query.message.answer_photo(
-                map_url,
-                caption=f"🗺 Карта осадков для местоположения: {location_name}"
-            )
-        else:
-            await callback_query.message.answer(
-                "Извините, карта осадков сейчас недоступна для этого местоположения."
-            )
+        # Форматируем прогноз
+        message = ["📊 Прогноз качества воздуха на ближайшие 24 часа:\n"]
+        for forecast in forecasts:
+            dt = datetime.fromtimestamp(forecast['dt'])
+            aqi = forecast['main']['aqi']
+            message.append(f"🕐 {dt.strftime('%H:%M')}: {aqi_levels[aqi]}")
         
+        await callback_query.message.answer("\n".join(message))
         await callback_query.answer()
         
     except Exception as e:
-        logging.error(f"Error showing rain map: {e}")
+        logging.error(f"Error getting air forecast: {e}")
         await callback_query.message.answer(
-            "Извините, произошла ошибка при получении карты осадков."
+            "Извините, произошла ошибка при получении прогноза качества воздуха."
         )
         await callback_query.answer()
 
@@ -973,9 +1003,273 @@ async def on_startup(app):
     print(f"Webhook set to {webhook_url}")
     print("Bot commands updated successfully")
 
+async def check_weather_conditions(city, lat, lon):
+    """Проверяет погодные условия и формирует предупреждения"""
+    try:
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                weather_data = await response.json()
+        
+        warnings = []
+        
+        # Проверяем температуру
+        temp = weather_data['main']['temp']
+        if temp > 30:
+            warnings.append(f"🌡 Сильная жара в {city}: {temp:.1f}°C")
+        elif temp < -15:
+            warnings.append(f"❄️ Сильный мороз в {city}: {temp:.1f}°C")
+        
+        # Проверяем осадки
+        if 'rain' in weather_data:
+            rain = weather_data['rain'].get('1h', 0)
+            if rain > 10:
+                warnings.append(f"🌧 Сильный дождь в {city}: {rain} мм/ч")
+        if 'snow' in weather_data:
+            snow = weather_data['snow'].get('1h', 0)
+            if snow > 5:
+                warnings.append(f"🌨 Сильный снег в {city}: {snow} мм/ч")
+        
+        # Проверяем ветер
+        wind_speed = weather_data['wind']['speed']
+        if wind_speed > 15:
+            warnings.append(f"💨 Сильный ветер в {city}: {wind_speed} м/с")
+        
+        # Обновляем статистику
+        for param in ['temp', 'humidity', 'pressure']:
+            weather_stats[city][param].append(weather_data['main'][param])
+            # Храним только последние 24 значения
+            weather_stats[city][param] = weather_stats[city][param][-24:]
+        
+        return warnings
+        
+    except Exception as e:
+        logging.error(f"Error checking weather conditions: {e}")
+        return []
+
+async def send_weather_alerts():
+    """Отправляет уведомления о погоде подписчикам"""
+    for user_id, subscriptions in weather_subscriptions.items():
+        for city, lat, lon in subscriptions:
+            warnings = await check_weather_conditions(city, lat, lon)
+            if warnings:
+                try:
+                    await bot.send_message(
+                        user_id,
+                        "⚠️ Предупреждения о погоде:\n" + "\n".join(warnings)
+                    )
+                except Exception as e:
+                    logging.error(f"Error sending alert to user {user_id}: {e}")
+
+async def find_nearby_shelters(lat, lon):
+    """Находит ближайшие места укрытия от непогоды"""
+    try:
+        # Используем OpenStreetMap Nominatim API для поиска ближайших мест
+        search_url = (
+            f"https://nominatim.openstreetmap.org/search"
+            f"?format=json"
+            f"&lat={lat}"
+            f"&lon={lon}"
+            f"&amenity=shelter,shopping_mall,library,cafe"
+            f"&limit=5"
+        )
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(search_url, headers={'User-Agent': 'WeatherBot/1.0'}) as response:
+                places = await response.json()
+        
+        return places
+    except Exception as e:
+        logging.error(f"Error finding shelters: {e}")
+        return []
+
+@dp.message(Command('subscribe'))
+async def subscribe_command(message: Message):
+    """Подписка на уведомления о погоде"""
+    try:
+        city = message.text.split(' ', 1)[1]
+    except IndexError:
+        await message.answer(
+            "Пожалуйста, укажите город после команды.\n"
+            "Например: /subscribe Москва"
+        )
+        return
+
+    try:
+        # Получаем координаты города
+        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(geo_url) as response:
+                geo_data = await response.json()
+        
+        if not geo_data:
+            await message.answer("Извините, не могу найти такой город. Попробуйте другой.")
+            return
+            
+        lat = geo_data[0]['lat']
+        lon = geo_data[0]['lon']
+        
+        # Добавляем подписку
+        user_id = message.from_user.id
+        if (city, lat, lon) not in weather_subscriptions[user_id]:
+            weather_subscriptions[user_id].append((city, lat, lon))
+            save_subscriptions()
+            await message.answer(f"✅ Вы успешно подписались на уведомления о погоде в городе {city}")
+        else:
+            await message.answer(f"Вы уже подписаны на уведомления о погоде в городе {city}")
+        
+    except Exception as e:
+        logging.error(f"Error in subscribe_command: {e}")
+        await message.answer(
+            "Извините, произошла ошибка при подписке на уведомления. "
+            "Пожалуйста, попробуйте позже."
+        )
+
+@dp.message(Command('unsubscribe'))
+async def unsubscribe_command(message: Message):
+    """Отписка от уведомлений о погоде"""
+    try:
+        city = message.text.split(' ', 1)[1]
+    except IndexError:
+        await message.answer(
+            "Пожалуйста, укажите город после команды.\n"
+            "Например: /unsubscribe Москва"
+        )
+        return
+
+    try:
+        user_id = message.from_user.id
+        # Находим и удаляем подписку
+        for sub in weather_subscriptions[user_id][:]:
+            if sub[0].lower() == city.lower():
+                weather_subscriptions[user_id].remove(sub)
+                save_subscriptions()
+                await message.answer(f"✅ Вы успешно отписались от уведомлений о погоде в городе {city}")
+                return
+        
+        await message.answer(f"Вы не были подписаны на уведомления о погоде в городе {city}")
+        
+    except Exception as e:
+        logging.error(f"Error in unsubscribe_command: {e}")
+        await message.answer(
+            "Извините, произошла ошибка при отписке от уведомлений. "
+            "Пожалуйста, попробуйте позже."
+        )
+
+@dp.message(Command('stats'))
+async def stats_command(message: Message):
+    """Показывает статистику погоды"""
+    try:
+        city = message.text.split(' ', 1)[1]
+    except IndexError:
+        await message.answer(
+            "Пожалуйста, укажите город после команды.\n"
+            "Например: /stats Москва"
+        )
+        return
+
+    try:
+        if city not in weather_stats or not weather_stats[city]['temp']:
+            await message.answer(
+                f"Извините, для города {city} пока нет статистики. "
+                "Статистика начнет собираться после подписки на уведомления."
+            )
+            return
+        
+        # Формируем статистику
+        stats = weather_stats[city]
+        temp_avg = sum(stats['temp']) / len(stats['temp'])
+        temp_min = min(stats['temp'])
+        temp_max = max(stats['temp'])
+        humidity_avg = sum(stats['humidity']) / len(stats['humidity'])
+        
+        message_text = (
+            f"📊 Статистика погоды в городе {city} (за последние 24 часа):\n\n"
+            f"🌡 Температура:\n"
+            f"   • Средняя: {temp_avg:.1f}°C\n"
+            f"   • Минимальная: {temp_min:.1f}°C\n"
+            f"   • Максимальная: {temp_max:.1f}°C\n"
+            f"💧 Средняя влажность: {humidity_avg:.1f}%"
+        )
+        
+        await message.answer(message_text)
+        
+    except Exception as e:
+        logging.error(f"Error in stats_command: {e}")
+        await message.answer(
+            "Извините, произошла ошибка при получении статистики. "
+            "Пожалуйста, попробуйте позже."
+        )
+
+@dp.message(Command('shelter'))
+async def shelter_command(message: Message):
+    """Поиск укрытия от непогоды"""
+    if not message.location:
+        await message.answer(
+            "Пожалуйста, отправьте свою геолокацию, чтобы я мог найти ближайшие укрытия."
+        )
+        return
+
+    try:
+        lat = message.location.latitude
+        lon = message.location.longitude
+        
+        # Получаем список ближайших укрытий
+        shelters = await find_nearby_shelters(lat, lon)
+        
+        if not shelters:
+            await message.answer(
+                "Извините, не удалось найти укрытия поблизости. "
+                "Попробуйте искать торговые центры или кафе в этом районе."
+            )
+            return
+        
+        # Формируем сообщение с укрытиями
+        message_text = "🏪 Ближайшие места, где можно укрыться от непогоды:\n\n"
+        for place in shelters:
+            distance = ((float(place['lat']) - lat) ** 2 + (float(place['lon']) - lon) ** 2) ** 0.5 * 111  # примерное расстояние в км
+            message_text += (
+                f"📍 {place['display_name'].split(',')[0]}\n"
+                f"   Расстояние: {distance:.1f} км\n"
+                f"   Адрес: {place['display_name']}\n\n"
+            )
+        
+        await message.answer(message_text)
+        
+    except Exception as e:
+        logging.error(f"Error in shelter_command: {e}")
+        await message.answer(
+            "Извините, произошла ошибка при поиске укрытий. "
+            "Пожалуйста, попробуйте позже."
+        )
+
+def save_subscriptions():
+    """Сохраняет подписки в файл"""
+    with open('weather_subscriptions.json', 'w', encoding='utf-8') as f:
+        json.dump({str(k): v for k, v in weather_subscriptions.items()}, f, ensure_ascii=False)
+
+def load_subscriptions():
+    """Загружает подписки из файла"""
+    global weather_subscriptions
+    try:
+        if os.path.exists('weather_subscriptions.json'):
+            with open('weather_subscriptions.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                weather_subscriptions = defaultdict(list, {int(k): v for k, v in data.items()})
+    except Exception as e:
+        logging.error(f"Error loading subscriptions: {e}")
+
 async def main():
     """Start the bot."""
     try:
+        # Загружаем сохраненные подписки
+        load_subscriptions()
+        
+        # Создаем планировщик для проверки погоды
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(send_weather_alerts, 'interval', minutes=30)
+        scheduler.start()
+        
         # Создаем веб-приложение
         app = web.Application()
         
