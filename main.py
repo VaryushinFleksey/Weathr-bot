@@ -2014,12 +2014,11 @@ async def main():
 # Обработчики веб-хуков
 @log_execution
 async def process_update(request):
-    """Обработчик входящих обновлений от Telegram"""
+    """Обработка входящих обновлений от Telegram"""
     try:
-        data = await request.json()
-        update = types.Update(**data)
-        await dp.feed_update(bot=bot, update=update)
-        return web.Response()
+        telegram_update = await request.json()
+        await dp.feed_raw_update(Bot(TELEGRAM_BOT_TOKEN), telegram_update)
+        return web.Response(status=200)
     except Exception as e:
         log_error(e, "Error processing update")
         return web.Response(status=500)
@@ -2085,77 +2084,29 @@ async def on_startup(app):
 # Функция для отправки уведомлений о погоде
 @log_execution
 async def send_weather_alerts():
-    """Отправляет уведомления о погоде подписчикам"""
-    logger.info("Starting weather alerts check")
-    for user_id, subscriptions in weather_subscriptions.items():
-        for city, lat, lon in subscriptions:
-            try:
-                warnings = await check_weather_conditions(city, lat, lon)
-                if warnings:
-                    await bot.send_message(
-                        user_id,
-                        "⚠️ Предупреждения о погоде:\n" + "\n".join(warnings)
-                    )
-                    logger.info(f"Sent {len(warnings)} warnings to user {user_id} for {city}")
-            except Exception as e:
-                log_error(e, f"Error sending alert to user {user_id} for {city}")
-
-# Функция для отправки умных уведомлений
-@log_execution
-async def send_smart_notifications():
-    """Отправляет умные уведомления пользователям"""
-    logger.info("Starting smart notifications check")
-    current_hour = datetime.now().strftime('%H:00')
-    
-    for user_id, prefs in user_preferences.items():
-        if prefs['notification_time'] != current_hour:
-            continue
+    """Отправка уведомлений о погоде"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT DISTINCT user_id FROM subscriptions')
+            users = cursor.fetchall()
             
-        try:
-            for city, lat, lon in weather_subscriptions[user_id]:
-                notifications = []
-                
-                # Проверяем условия для активностей
-                if prefs['activities']:
-                    activity_notice = await check_activity_conditions(city, lat, lon, prefs['activities'])
-                    if activity_notice:
-                        notifications.append(activity_notice)
-                
-                # Получаем текущую погоду
-                weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(weather_url) as response:
-                        weather_data = await check_api_response(response, "send_smart_notifications")
-                
-                temp = weather_data['main']['temp']
-                
-                # Проверяем температурный диапазон
-                if not (prefs['temp_range']['min'] <= temp <= prefs['temp_range']['max']):
-                    notifications.append(
-                        f"🌡 Температура в {city} ({temp:.1f}°C) вне вашего комфортного диапазона "
-                        f"({prefs['temp_range']['min']}°C - {prefs['temp_range']['max']}°C)"
-                    )
-                
-                # Проверяем ветер
-                wind_speed = weather_data['wind']['speed']
-                if wind_speed > prefs['wind_threshold']:
-                    notifications.append(f"💨 Сильный ветер в {city}: {wind_speed} м/с")
-                
-                # Проверяем дождь
-                if prefs['rain_alerts'] and 'rain' in weather_data:
-                    rain = weather_data['rain'].get('1h', 0)
-                    if rain > 0:
-                        notifications.append(f"🌧 Ожидается дождь в {city}: {rain} мм/ч")
-                
-                if notifications:
-                    await bot.send_message(
-                        user_id,
-                        "🔔 Умные уведомления:\n\n" + "\n\n".join(notifications)
-                    )
-                    logger.info(f"Sent {len(notifications)} smart notifications to user {user_id} for {city}")
-                    
-        except Exception as e:
-            log_error(e, f"Error sending smart notifications to user {user_id}")
+        for (user_id,) in users:
+            try:
+                subscriptions = get_user_subscriptions(user_id)
+                for city, lat, lon in subscriptions:
+                    warnings = await check_weather_conditions(city, lat, lon)
+                    if warnings:
+                        await bot.send_message(
+                            user_id,
+                            "⚠️ Предупреждения о погоде:\n" + "\n".join(warnings)
+                        )
+                        logger.info(f"Sent {len(warnings)} warnings to user {user_id} for {city}")
+            except Exception as e:
+                log_error(e, f"Error sending alert to user {user_id}")
+                continue
+    except Exception as e:
+        log_error(e, "Error in send_weather_alerts")
 
 # Функция для проверки условий для активностей
 @log_execution
