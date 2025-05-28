@@ -13,7 +13,13 @@ import sys
 from aiohttp import web  # Добавляем импорт aiohttp
 import aiohttp
 import math  # Добавляем импорт math
-import googlemaps
+
+# Опционально импортируем googlemaps
+try:
+    import googlemaps
+    GOOGLE_MAPS_AVAILABLE = True
+except ImportError:
+    GOOGLE_MAPS_AVAILABLE = False
 
 # Load environment variables
 load_dotenv()
@@ -33,8 +39,14 @@ GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
-# Initialize Google Maps client
-gmaps = googlemaps.Client(key=GOOGLE_API_KEY)
+# Initialize Google Maps client only if API key is available
+gmaps = None
+if GOOGLE_MAPS_AVAILABLE and GOOGLE_API_KEY:
+    try:
+        gmaps = googlemaps.Client(key=GOOGLE_API_KEY)
+        logging.info("Google Maps API initialized successfully")
+    except Exception as e:
+        logging.warning(f"Failed to initialize Google Maps API: {e}")
 
 # Bot commands for menu
 COMMANDS = [
