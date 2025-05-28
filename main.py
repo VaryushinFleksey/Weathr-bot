@@ -539,27 +539,45 @@ async def get_weather(message: Message):
             "Пожалуйста, попробуйте позже."
         )
 
+async def healthcheck():
+    """Простой обработчик для проверки работоспособности"""
+    return web.Response(text="Bot is running")
+
 async def main():
     """Start the bot."""
-    # Set bot commands
     try:
+        # Удаляем вебхук, если он был
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.set_my_commands(COMMANDS)
         print("Bot commands updated successfully")
         
-        # Start polling
-        print("Бот запущен")
+        # Создаем веб-приложение для Render
+        app = web.Application()
+        app.router.add_get('/', healthcheck)
+        
+        # Получаем порт из переменных окружения
+        port = int(os.environ.get('PORT', 8080))
+        
+        # Запускаем веб-сервер
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        print(f"Web server is running on port {port}")
+        
+        # Запускаем бота в режиме polling
+        print("Starting bot polling...")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
         
     except Exception as e:
-        print(f"Ошибка: {e}")
+        print(f"Error: {e}")
         raise
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print('Бот остановлен')
+        print('Bot stopped')
     except Exception as e:
-        print(f"Критическая ошибка: {e}")
+        print(f"Critical error: {e}")
         sys.exit(1) 
