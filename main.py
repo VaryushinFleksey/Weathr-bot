@@ -543,10 +543,17 @@ async def healthcheck():
     """Простой обработчик для проверки работоспособности"""
     return web.Response(text="Bot is running")
 
+async def on_shutdown(app):
+    """Корректное завершение работы бота"""
+    print("Shutting down...")
+    await bot.session.close()
+    await dp.storage.close()
+    await dp.stop_polling()
+
 async def main():
     """Start the bot."""
     try:
-        # Удаляем вебхук, если он был
+        # Удаляем вебхук и старые обновления
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.set_my_commands(COMMANDS)
         print("Bot commands updated successfully")
@@ -554,6 +561,7 @@ async def main():
         # Создаем веб-приложение для Render
         app = web.Application()
         app.router.add_get('/', healthcheck)
+        app.on_shutdown.append(on_shutdown)
         
         # Получаем порт из переменных окружения
         port = int(os.environ.get('PORT', 8080))
@@ -565,16 +573,26 @@ async def main():
         await site.start()
         print(f"Web server is running on port {port}")
         
-        # Запускаем бота в режиме polling
+        # Запускаем бота в режиме polling с таймаутом
         print("Starting bot polling...")
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await dp.start_polling(bot, 
+                             allowed_updates=dp.resolve_used_update_types(),
+                             polling_timeout=30)
         
     except Exception as e:
         print(f"Error: {e}")
         raise
+    finally:
+        # Убеждаемся, что бот корректно завершит работу
+        await on_shutdown(app)
 
 if __name__ == '__main__':
     try:
+        # Добавляем обработчики сигналов
+        for signal_name in ('SIGINT', 'SIGTERM'):
+            if hasattr(signal, signal_name):
+                signal.signal(getattr(signal, signal_name), lambda s, f: asyncio.get_event_loop().stop())
+        
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print('Bot stopped')
