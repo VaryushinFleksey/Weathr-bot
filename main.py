@@ -539,6 +539,13 @@ async def get_weather(message: Message):
             "Пожалуйста, попробуйте позже."
         )
 
+async def process_update(request):
+    """Обработчик входящих обновлений от Telegram"""
+    data = await request.json()
+    update = types.Update(**data)
+    await dp.feed_update(bot=bot, update=update)
+    return web.Response()
+
 async def healthcheck(request):
     """Простой обработчик для проверки работоспособности"""
     return web.Response(text="Bot is running")
@@ -549,28 +556,38 @@ async def on_shutdown(app):
     try:
         await bot.session.close()
         await dp.storage.close()
-        await dp.stop_polling()
     except Exception as e:
         print(f"Error during shutdown: {e}")
+
+async def on_startup(app):
+    """Действия при запуске"""
+    webhook_path = f"/webhook/{TELEGRAM_BOT_TOKEN}"
+    webhook_url = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:8080') + webhook_path
+    
+    # Устанавливаем вебхук
+    await bot.set_webhook(
+        url=webhook_url,
+        drop_pending_updates=True
+    )
+    
+    # Устанавливаем команды бота
+    await bot.set_my_commands(COMMANDS)
+    print(f"Webhook set to {webhook_url}")
+    print("Bot commands updated successfully")
 
 async def main():
     """Start the bot."""
     try:
-        # Принудительно удаляем все предыдущие обновления и вебхук
-        print("Removing webhook...")
-        await bot.delete_webhook(drop_pending_updates=True)
-        
-        # Очищаем все обновления перед стартом
-        print("Skipping pending updates...")
-        await bot.get_updates(offset=-1)
-        
-        # Устанавливаем команды бота
-        await bot.set_my_commands(COMMANDS)
-        print("Bot commands updated successfully")
-        
-        # Создаем веб-приложение для Render
+        # Создаем веб-приложение
         app = web.Application()
-        app.router.add_get('/', healthcheck)
+        
+        # Добавляем обработчики
+        webhook_path = f"/webhook/{TELEGRAM_BOT_TOKEN}"
+        app.router.add_post(webhook_path, process_update)
+        app.router.add_get("/", healthcheck)
+        
+        # Добавляем обработчики событий приложения
+        app.on_startup.append(on_startup)
         app.on_shutdown.append(on_shutdown)
         
         # Получаем порт из переменных окружения
@@ -583,19 +600,13 @@ async def main():
         await site.start()
         print(f"Web server is running on port {port}")
         
-        # Запускаем бота в режиме polling с таймаутом и защитой от конфликтов
-        print("Starting bot polling...")
-        await dp.start_polling(bot, 
-                             allowed_updates=dp.resolve_used_update_types(),
-                             polling_timeout=30,
-                             skip_updates=True,  # Пропускаем обновления при старте
-                             reset_webhook=True)  # Сбрасываем вебхук при старте
+        # Ждем завершения
+        await asyncio.Event().wait()
         
     except Exception as e:
         print(f"Error: {e}")
         raise
     finally:
-        # Убеждаемся, что бот корректно завершит работу
         await on_shutdown(app)
 
 if __name__ == '__main__':
