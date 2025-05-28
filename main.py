@@ -13,10 +13,11 @@ import sys
 from aiohttp import web
 import aiohttp
 import math
+from urllib.parse import quote
 import json
 from collections import defaultdict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from urllib.parse import quote
+from contextlib import suppress
 
 # Load environment variables
 load_dotenv()
@@ -34,6 +35,9 @@ OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
 # Initialize bot and dispatcher
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+scheduler = None
+app = None
+runner = None
 
 # Bot commands for menu
 COMMANDS = [
@@ -1080,14 +1084,31 @@ async def healthcheck(request):
     """Простой обработчик для проверки работоспособности"""
     return web.Response(text="Bot is running")
 
-async def on_shutdown(app):
+async def shutdown(dispatcher: Dispatcher):
     """Корректное завершение работы бота"""
-    print("Shutting down...")
-    try:
-        await bot.session.close()
-        await dp.storage.close()
-    except Exception as e:
-        print(f"Error during shutdown: {e}")
+    logging.info("Shutting down...")
+    
+    # Отключаем планировщик
+    if scheduler:
+        scheduler.shutdown(wait=False)
+    
+    # Закрываем соединения
+    await dispatcher.storage.close()
+    await dispatcher.storage.wait_closed()
+    
+    # Закрываем сессию бота
+    session = await bot.get_session()
+    if session:
+        await session.close()
+    
+    # Останавливаем веб-приложение
+    if runner:
+        await runner.cleanup()
+
+async def on_shutdown(app):
+    """Действия при завершении работы веб-приложения"""
+    logging.info("Stopping web application...")
+    await shutdown(dp)
 
 async def on_startup(app):
     """Действия при запуске"""
@@ -1640,15 +1661,23 @@ async def process_activity_toggle(callback_query: types.CallbackQuery):
 
 async def main():
     """Start the bot."""
+    global scheduler, app, runner
+    
     try:
-        # Загружаем сохраненные подписки и настройки
+        # Настраиваем логирование
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        
+        # Загружаем сохраненные данные
         load_subscriptions()
         load_user_preferences()
         
-        # Создаем планировщик
+        # Инициализируем планировщик
         scheduler = AsyncIOScheduler()
         scheduler.add_job(send_weather_alerts, 'interval', minutes=30)
-        scheduler.add_job(send_smart_notifications, 'interval', minutes=60)  # Проверяем каждый час
+        scheduler.add_job(send_smart_notifications, 'interval', minutes=60)
         scheduler.start()
         
         # Создаем веб-приложение
@@ -1670,30 +1699,44 @@ async def main():
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', port)
+        
+        # Устанавливаем обработчики сигналов
+        for signal_name in ('SIGINT', 'SIGTERM'):
+            try:
+                signal.signal(
+                    getattr(signal, signal_name),
+                    lambda s, f: asyncio.create_task(shutdown(dp))
+                )
+            except AttributeError:
+                pass
+        
+        # Запускаем бота
         await site.start()
-        print(f"Web server is running on port {port}")
+        logging.info(f"Bot started on port {port}")
         
         # Ждем завершения
         await asyncio.Event().wait()
         
     except Exception as e:
-        print(f"Error: {e}")
-        raise
-    finally:
-        await on_shutdown(app)
+        logging.error(f"Critical error in main: {e}", exc_info=True)
+        if runner:
+            await runner.cleanup()
+        sys.exit(1)
 
+# Обновим точку входа
 if __name__ == '__main__':
     try:
-        # Добавляем обработчики сигналов
-        for signal_name in ('SIGINT', 'SIGTERM'):
-            if hasattr(signal, signal_name):
-                signal.signal(getattr(signal, signal_name), lambda s, f: asyncio.get_event_loop().stop())
+        # Запускаем бота в отдельной задаче
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-        # Запускаем бота
-        print("Starting bot...")
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print('Bot stopped')
+        # Запускаем основной цикл с обработкой исключений
+        with suppress(KeyboardInterrupt, SystemExit):
+            loop.run_until_complete(main())
     except Exception as e:
-        print(f"Critical error: {e}")
-        sys.exit(1) 
+        logging.error(f"Fatal error: {e}", exc_info=True)
+    finally:
+        # Закрываем loop
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        logging.info("Bot stopped")
