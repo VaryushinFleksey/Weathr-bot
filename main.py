@@ -1962,7 +1962,7 @@ async def process_activity_callback(callback_query: types.CallbackQuery):
 
 async def main():
     """Start the bot."""
-    global scheduler, app, runner
+    global scheduler
     
     try:
         # Настраиваем логирование
@@ -1980,47 +1980,18 @@ async def main():
         scheduler.start()
         logger.info("Scheduler started")
         
-        # Создаем веб-приложение
-        app = web.Application()
+        # Устанавливаем команды бота
+        await bot.set_my_commands(COMMANDS)
+        logger.info("Bot commands updated successfully")
         
-        # Добавляем обработчики
-        webhook_path = f"/webhook/{TELEGRAM_BOT_TOKEN}"
-        app.router.add_post(webhook_path, process_update)
-        app.router.add_get("/", healthcheck)
-        
-        # Добавляем обработчики событий приложения
-        app.on_startup.append(on_startup)
-        app.on_shutdown.append(on_shutdown)
-        
-        # Получаем порт из переменных окружения
-        port = int(os.environ.get('PORT', 8080))
-        
-        # Запускаем веб-сервер
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        
-        # Устанавливаем обработчики сигналов
-        for signal_name in ('SIGINT', 'SIGTERM'):
-            try:
-                signal.signal(
-                    getattr(signal, signal_name),
-                    lambda s, f: asyncio.create_task(shutdown(dp))
-                )
-            except AttributeError:
-                pass
-        
-        # Запускаем бота
-        await site.start()
-        logger.info(f"Bot started on port {port}")
-        
-        # Ждем завершения
-        await asyncio.Event().wait()
+        # Запускаем бота в режиме polling
+        logger.info("Starting bot polling...")
+        await dp.start_polling(bot)
         
     except Exception as e:
         log_error(e, "Critical error in main")
-        if runner:
-            await runner.cleanup()
+        if scheduler:
+            scheduler.shutdown()
         sys.exit(1)
 
 # Обработчики веб-хуков
@@ -2028,9 +1999,9 @@ async def main():
 async def process_update(request):
     """Обработка входящих обновлений от Telegram"""
     try:
-        telegram_update = await request.json()
-        await dp.feed_raw_update(Bot(TELEGRAM_BOT_TOKEN), telegram_update)
-        return web.Response(status=200)
+        update = types.Update(**(await request.json()))
+        await dp.feed_update(bot=bot, update=update)
+        return web.Response()
     except Exception as e:
         log_error(e, "Error processing update")
         return web.Response(status=500)
@@ -2096,129 +2067,119 @@ async def on_startup(app):
 # Функция для отправки уведомлений о погоде
 @log_execution
 async def send_weather_alerts():
-    """Отправка уведомлений о погоде"""
+    """Отправка уведомлений о погодных предупреждениях"""
     try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT DISTINCT user_id FROM subscriptions')
-            users = cursor.fetchall()
-            
-        for (user_id,) in users:
-            try:
-                subscriptions = get_user_subscriptions(user_id)
-                for city, lat, lon in subscriptions:
-                    warnings = await check_weather_conditions(city, lat, lon)
-                    if warnings:
-                        await bot.send_message(
-                            user_id,
-                            "⚠️ Предупреждения о погоде:\n" + "\n".join(warnings)
-                        )
-                        logger.info(f"Sent {len(warnings)} warnings to user {user_id} for {city}")
-            except Exception as e:
-                log_error(e, f"Error sending alert to user {user_id}")
-                continue
+        for user_id, cities in weather_subscriptions.items():
+            for city, lat, lon in cities:
+                # Получаем данные о погоде
+                weather_data = await get_weather_data(lat, lon)
+                if not weather_data:
+                    continue
+                
+                # Проверяем наличие предупреждений
+                alerts = check_weather_alerts(weather_data)
+                if alerts:
+                    await bot.send_message(
+                        user_id,
+                        f"⚠️ Погодные предупреждения для {city}:\n\n" + "\n".join(alerts)
+                    )
+                    logger.info(f"Sent weather alert to user {user_id} for {city}")
     except Exception as e:
         log_error(e, "Error in send_weather_alerts")
 
-# Функция для проверки условий для активностей
-@log_execution
-async def check_activity_conditions(city, lat, lon, activities):
-    """Проверяет условия для активностей"""
+async def send_smart_notifications():
+    """Отправка умных уведомлений о погоде"""
     try:
-        logger.info(f"Checking activity conditions for {city}")
-        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(weather_url) as response:
-                weather_data = await check_api_response(response, "check_activity_conditions")
-        
-        temp = weather_data['main']['temp']
-        wind_speed = weather_data['wind']['speed']
-        is_rain = 'rain' in weather_data
-        
-        suitable_activities = []
-        
-        for activity in activities:
-            if activity not in ACTIVITIES:
+        for user_id, cities in weather_subscriptions.items():
+            # Получаем настройки пользователя
+            prefs = get_user_preferences_db(user_id)
+            if not prefs:
                 continue
-                
-            conditions = ACTIVITIES[activity]
-            temp_min, temp_max = conditions['temp_range']
             
-            if (temp_min <= temp <= temp_max and
-                wind_speed <= conditions['wind_max'] and
-                (not conditions['no_rain'] or not is_rain)):
-                suitable_activities.append(conditions['description'])
-        
-        if suitable_activities:
-            return f"🎯 Отличные условия в {city} для: {', '.join(suitable_activities)}!"
-        return None
-        
+            for city, lat, lon in cities:
+                # Получаем данные о погоде
+                weather_data = await get_weather_data(lat, lon)
+                if not weather_data:
+                    continue
+                
+                # Проверяем условия для уведомлений
+                notifications = check_smart_notifications(weather_data, prefs)
+                if notifications:
+                    await bot.send_message(
+                        user_id,
+                        f"🎯 Умные уведомления для {city}:\n\n" + "\n".join(notifications)
+                    )
+                    logger.info(f"Sent smart notification to user {user_id} for {city}")
     except Exception as e:
-        log_error(e, f"Error checking activity conditions for {city}")
-        return None
+        log_error(e, "Error in send_smart_notifications")
 
-async def main():
-    """Start the bot."""
-    global scheduler, app, runner
+def check_weather_alerts(weather_data):
+    """Проверяет наличие погодных предупреждений"""
+    alerts = []
     
+    # Проверяем экстремальные температуры
+    temp = weather_data.get('main', {}).get('temp')
+    if temp is not None:
+        if temp > 35:
+            alerts.append("🌡 Экстремально высокая температура!")
+        elif temp < -25:
+            alerts.append("❄️ Экстремально низкая температура!")
+    
+    # Проверяем сильный ветер
+    wind_speed = weather_data.get('wind', {}).get('speed')
+    if wind_speed and wind_speed > 15:
+        alerts.append("💨 Штормовое предупреждение: сильный ветер!")
+    
+    # Проверяем осадки
+    if 'rain' in weather_data:
+        rain = weather_data['rain'].get('1h', 0)
+        if rain > 10:
+            alerts.append("🌧 Сильный дождь!")
+    
+    if 'snow' in weather_data:
+        snow = weather_data['snow'].get('1h', 0)
+        if snow > 5:
+            alerts.append("🌨 Сильный снегопад!")
+    
+    return alerts
+
+def check_smart_notifications(weather_data, preferences):
+    """Проверяет условия для умных уведомлений"""
+    notifications = []
+    
+    temp = weather_data.get('main', {}).get('temp')
+    wind_speed = weather_data.get('wind', {}).get('speed')
+    
+    # Проверяем температурный диапазон
+    temp_range = preferences.get('temp_range', {'min': 15, 'max': 25})
+    if temp is not None:
+        if temp < temp_range['min']:
+            notifications.append("🌡 Температура ниже комфортной")
+        elif temp > temp_range['max']:
+            notifications.append("🌡 Температура выше комфортной")
+    
+    # Проверяем ветер
+    wind_threshold = preferences.get('wind_threshold', 10)
+    if wind_speed and wind_speed > wind_threshold:
+        notifications.append("💨 Ветер сильнее предпочитаемого")
+    
+    # Проверяем дождь
+    if preferences.get('rain_alerts', True) and 'rain' in weather_data:
+        notifications.append("☔️ Ожидается дождь")
+    
+    return notifications
+
+async def get_weather_data(lat, lon):
+    """Получает данные о погоде по координатам"""
     try:
-        # Настраиваем логирование
-        logger.info("Starting bot initialization...")
-        
-        # Загружаем сохраненные данные
-        load_subscriptions()
-        load_user_preferences()
-        logger.info("Loaded saved data")
-        
-        # Инициализируем планировщик
-        scheduler = AsyncIOScheduler()
-        scheduler.add_job(send_weather_alerts, 'interval', minutes=30)
-        scheduler.add_job(send_smart_notifications, 'interval', minutes=60)
-        scheduler.start()
-        logger.info("Scheduler started")
-        
-        # Создаем веб-приложение
-        app = web.Application()
-        
-        # Добавляем обработчики
-        webhook_path = f"/webhook/{TELEGRAM_BOT_TOKEN}"
-        app.router.add_post(webhook_path, process_update)
-        app.router.add_get("/", healthcheck)
-        
-        # Добавляем обработчики событий приложения
-        app.on_startup.append(on_startup)
-        app.on_shutdown.append(on_shutdown)
-        
-        # Получаем порт из переменных окружения
-        port = int(os.environ.get('PORT', 8080))
-        
-        # Запускаем веб-сервер
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        
-        # Устанавливаем обработчики сигналов
-        for signal_name in ('SIGINT', 'SIGTERM'):
-            try:
-                signal.signal(
-                    getattr(signal, signal_name),
-                    lambda s, f: asyncio.create_task(shutdown(dp))
-                )
-            except AttributeError:
-                pass
-        
-        # Запускаем бота
-        await site.start()
-        logger.info(f"Bot started on port {port}")
-        
-        # Ждем завершения
-        await asyncio.Event().wait()
-        
+        url = f"http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=API_TIMEOUT) as response:
+                data = await check_api_response(response, "get_weather_data")
+                return data
     except Exception as e:
-        log_error(e, "Critical error in main")
-        if runner:
-            await runner.cleanup()
-        sys.exit(1)
+        log_error(e, f"Error getting weather data for coordinates {lat}, {lon}")
+        return None
 
 # Обновим точку входа
 if __name__ == '__main__':
