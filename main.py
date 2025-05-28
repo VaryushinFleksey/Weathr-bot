@@ -11,6 +11,7 @@ import pytz
 import signal
 import sys
 from aiohttp import web  # Добавляем импорт aiohttp
+import aiohttp
 
 # Load environment variables
 load_dotenv()
@@ -37,7 +38,9 @@ COMMANDS = [
     BotCommand(command='detailed', description='Подробная информация о погоде'),
     BotCommand(command='air', description='Качество воздуха'),
     BotCommand(command='compare', description='Сравнить погоду в двух городах'),
-    BotCommand(command='alerts', description='Погодные предупреждения')
+    BotCommand(command='alerts', description='Погодные предупреждения'),
+    BotCommand(command='wear', description='Рекомендации по одежде'),
+    BotCommand(command='rain', description='Карта осадков')
 ]
 
 def create_main_keyboard():
@@ -138,7 +141,9 @@ async def start_command(message: Message):
         '4. Качество воздуха (/air город)\n'
         '5. Определить погоду по геолокации\n'
         '6. Сравнить погоду в разных городах (/compare)\n'
-        '7. Показать погодные предупреждения (/alerts город)\n\n'
+        '7. Показать погодные предупреждения (/alerts город)\n'
+        '8. Получить рекомендации по одежде (/wear город)\n'
+        '9. Получить карту осадков (/rain город)\n\n'
         'Используйте кнопку ниже, чтобы отправить свою геолокацию!',
         reply_markup=create_main_keyboard()
     )
@@ -154,7 +159,9 @@ async def help_command(message: Message):
         '4. /air ГОРОД - качество воздуха\n'
         '5. /compare - сравнить погоду в городах\n'
         '6. /alerts ГОРОД - погодные предупреждения\n'
-        '7. Нажмите кнопку "📍 Отправить геолокацию" для погоды в вашем месте\n\n'
+        '7. /wear ГОРОД - рекомендации по одежде\n'
+        '8. /rain ГОРОД - карта осадков\n'
+        '9. Нажмите кнопку "📍 Отправить геолокацию" для погоды в вашем месте\n\n'
         'Примеры:\n'
         '- "Москва" - текущая погода\n'
         '- "/forecast Париж" - прогноз на 5 дней\n'
@@ -241,7 +248,7 @@ async def air_quality_command(message: Message):
         
         # AQI levels description
         aqi_levels = {
-            1: "Отличное 😊",
+            1: "Отличное ",
             2: "Хорошее 🙂",
             3: "Умеренное 😐",
             4: "Плохое 😷",
@@ -496,6 +503,165 @@ async def alerts_command(message: Message):
             "Пожалуйста, попробуйте позже."
         )
 
+@dp.message(Command('wear'))
+async def wear_command(message: Message):
+    """Получить рекомендации по одежде для указанного города."""
+    try:
+        city = message.text.split(' ', 1)[1]
+    except IndexError:
+        await message.answer(
+            "Пожалуйста, укажите город после команды.\n"
+            "Например: /wear Москва"
+        )
+        return
+
+    try:
+        # Получаем координаты
+        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
+        geo_response = requests.get(geo_url)
+        geo_data = geo_response.json()
+        
+        if not geo_data:
+            await message.answer("Извините, не могу найти такой город. Попробуйте другой.")
+            return
+            
+        lat = geo_data[0]['lat']
+        lon = geo_data[0]['lon']
+        
+        # Получаем данные о погоде
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        weather_response = requests.get(weather_url)
+        weather_data = weather_response.json()
+        
+        # Получаем рекомендации
+        recommendations = get_clothing_recommendations(weather_data)
+        
+        # Формируем сообщение
+        temp = weather_data['main']['temp']
+        feels_like = weather_data['main']['feels_like']
+        description = weather_data['weather'][0]['description']
+        
+        message_text = (
+            f"👔 Рекомендации по одежде для {city}:\n\n"
+            f"🌡 Температура: {temp:.1f}°C\n"
+            f"🤔 Ощущается как: {feels_like:.1f}°C\n"
+            f"☁️ Условия: {description}\n\n"
+            f"Рекомендуется надеть:\n"
+            f"{chr(10).join('- ' + item for item in recommendations)}"
+        )
+        
+        await message.answer(message_text)
+        
+    except Exception as e:
+        logging.error(f"Error getting clothing recommendations: {e}")
+        await message.answer(
+            "Извините, произошла ошибка при получении рекомендаций. "
+            "Пожалуйста, попробуйте позже."
+        )
+
+@dp.message(Command('rain'))
+async def rain_map_command(message: Message):
+    """Отправляет карту осадков для указанного города"""
+    try:
+        city = message.text.split(' ', 1)[1]
+    except IndexError:
+        await message.answer(
+            "Пожалуйста, укажите город после команды.\n"
+            "Например: /rain Москва"
+        )
+        return
+
+    try:
+        # Получаем координаты города
+        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
+        geo_response = requests.get(geo_url)
+        geo_data = geo_response.json()
+        
+        if not geo_data:
+            await message.answer("Извините, не могу найти такой город. Попробуйте другой.")
+            return
+            
+        lat = geo_data[0]['lat']
+        lon = geo_data[0]['lon']
+        
+        # Получаем URL карты осадков
+        map_url = await get_precipitation_map(lat, lon)
+        
+        if map_url:
+            # Создаем inline клавиатуру для изменения масштаба
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="Приблизить", callback_data=f"zoom_in_{city}"),
+                        InlineKeyboardButton(text="Отдалить", callback_data=f"zoom_out_{city}")
+                    ]
+                ]
+            )
+            
+            await message.answer_photo(
+                map_url,
+                caption=f"🗺 Карта осадков для города {city}\n"
+                        f"🔵 Синий цвет - дождь\n"
+                        f"🟣 Фиолетовый цвет - смешанные осадки\n"
+                        f"⚪️ Белый цвет - снег",
+                reply_markup=keyboard
+            )
+        else:
+            await message.answer(
+                "Извините, не удалось получить карту осадков. "
+                "Пожалуйста, попробуйте позже."
+            )
+            
+    except Exception as e:
+        logging.error(f"Error in rain_map_command: {e}")
+        await message.answer(
+            "Извините, произошла ошибка при получении карты осадков. "
+            "Пожалуйста, попробуйте позже."
+        )
+
+# Добавляем обработчики для кнопок масштабирования
+@dp.callback_query(lambda c: c.data.startswith(('zoom_in_', 'zoom_out_')))
+async def process_zoom(callback_query: types.CallbackQuery):
+    """Обрабатывает нажатия кнопок масштабирования карты"""
+    try:
+        action, city = callback_query.data.split('_', 1)
+        zoom = 10 if action == 'zoom_in' else 6
+        
+        # Получаем координаты города
+        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
+        geo_response = requests.get(geo_url)
+        geo_data = geo_response.json()
+        
+        if not geo_data:
+            await callback_query.answer("Город не найден")
+            return
+            
+        lat = geo_data[0]['lat']
+        lon = geo_data[0]['lon']
+        
+        # Получаем новую карту с измененным масштабом
+        map_url = await get_precipitation_map(lat, lon, zoom)
+        
+        if map_url:
+            # Обновляем изображение
+            await callback_query.message.edit_media(
+                types.InputMediaPhoto(
+                    media=map_url,
+                    caption=f"🗺 Карта осадков для города {city}\n"
+                            f"🔵 Синий цвет - дождь\n"
+                            f"🟣 Фиолетовый цвет - смешанные осадки\n"
+                            f"⚪️ Белый цвет - снег"
+                ),
+                reply_markup=callback_query.message.reply_markup
+            )
+            await callback_query.answer()
+        else:
+            await callback_query.answer("Не удалось обновить карту")
+            
+    except Exception as e:
+        logging.error(f"Error in process_zoom: {e}")
+        await callback_query.answer("Произошла ошибка при изменении масштаба")
+
 @dp.message()
 async def get_weather(message: Message):
     """Get current weather for the specified city."""
@@ -623,4 +789,110 @@ if __name__ == '__main__':
         print('Bot stopped')
     except Exception as e:
         print(f"Critical error: {e}")
-        sys.exit(1) 
+        sys.exit(1)
+
+def get_clothing_recommendations(weather_data):
+    """Формирует рекомендации по одежде на основе погодных условий"""
+    temp = weather_data['main']['temp']
+    feels_like = weather_data['main']['feels_like']
+    wind_speed = weather_data['wind']['speed']
+    description = weather_data['weather'][0]['description'].lower()
+    humidity = weather_data['main']['humidity']
+    
+    recommendations = []
+    
+    # Базовые рекомендации по температуре
+    if feels_like <= -20:
+        recommendations.extend([
+            "🧥 Теплый зимний пуховик или шуба",
+            "🧣 Теплый шарф",
+            "🧤 Теплые перчатки или варежки",
+            "👢 Зимние утепленные ботинки",
+            "🧦 Теплые носки, желательно шерстяные",
+            "👖 Теплые зимние брюки или термобелье"
+        ])
+    elif -20 < feels_like <= -10:
+        recommendations.extend([
+            "🧥 Зимняя куртка или пуховик",
+            "🧣 Шарф",
+            "🧤 Перчатки",
+            "👢 Зимняя обувь",
+            "🧦 Теплые носки"
+        ])
+    elif -10 < feels_like <= 0:
+        recommendations.extend([
+            "🧥 Демисезонная куртка или легкий пуховик",
+            "🧣 Легкий шарф",
+            "🧤 Перчатки",
+            "👞 Утепленная обувь"
+        ])
+    elif 0 < feels_like <= 10:
+        recommendations.extend([
+            "🧥 Легкая куртка или плащ",
+            "🧥 Свитер или кофта",
+            "👞 Закрытая обувь"
+        ])
+    elif 10 < feels_like <= 20:
+        recommendations.extend([
+            "👕 Легкая кофта или рубашка",
+            "👖 Брюки или джинсы",
+            "👟 Легкая обувь"
+        ])
+    elif 20 < feels_like <= 25:
+        recommendations.extend([
+            "👕 Футболка или рубашка с коротким рукавом",
+            "👖 Легкие брюки или шорты",
+            "👟 Легкая обувь или сандалии"
+        ])
+    else:  # > 25
+        recommendations.extend([
+            "👕 Легкая одежда из натуральных тканей",
+            "🩳 Шорты или легкая юбка",
+            "👡 Сандалии или открытая обувь"
+        ])
+    
+    # Дополнительные рекомендации в зависимости от условий
+    if "дождь" in description or "ливень" in description:
+        recommendations.extend([
+            "☔️ Зонт",
+            "🧥 Водонепроницаемая куртка или плащ",
+            "👢 Непромокаемая обувь"
+        ])
+    
+    if "снег" in description:
+        recommendations.append("👢 Водонепроницаемая обувь с нескользящей подошвой")
+    
+    if wind_speed > 10:
+        recommendations.append("🧥 Ветрозащитная куртка или плащ")
+    
+    if humidity > 80 and temp > 20:
+        recommendations.append("👕 Легкая дышащая одежда из натуральных тканей")
+    
+    if "солнечно" in description or "ясно" in description:
+        if temp > 20:
+            recommendations.extend([
+                "🧢 Головной убор от солнца",
+                "🕶 Солнцезащитные очки"
+            ])
+    
+    return recommendations
+
+async def get_precipitation_map(lat, lon, zoom=8):
+    """Получает карту осадков для заданных координат"""
+    # Формируем URL для карты осадков
+    map_url = (
+        f"https://tile.openweathermap.org/map/precipitation_new/{zoom}/{lat}/{lon}.png"
+        f"?appid={OPENWEATHER_API_KEY}"
+    )
+    
+    try:
+        # Загружаем изображение карты
+        async with aiohttp.ClientSession() as session:
+            async with session.get(map_url) as response:
+                if response.status == 200:
+                    return map_url
+                else:
+                    return None
+    except Exception as e:
+        logging.error(f"Error fetching precipitation map: {e}")
+        return None 
