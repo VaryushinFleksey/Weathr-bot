@@ -1075,7 +1075,7 @@ async def get_city_coordinates(city_name: str) -> tuple[float, float, str] | Non
         logging.error(f"Error in get_city_coordinates: {e}")
         return None
 
-@dp.message()
+@dp.message(lambda message: not message.text.startswith('/'))
 async def get_weather(message: Message):
     """Get current weather for the specified city."""
     if message.text == "ℹ️ Помощь":
