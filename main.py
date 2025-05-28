@@ -208,6 +208,9 @@ scheduler = None
 app = None
 runner = None
 
+# Initialize database
+init_db()
+
 # Database context manager
 @contextmanager
 def get_db():
