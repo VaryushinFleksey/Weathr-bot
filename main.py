@@ -6,7 +6,7 @@ from aiogram.types import Message, BotCommand, ReplyKeyboardMarkup, KeyboardButt
 import requests
 from dotenv import load_dotenv
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import pytz
 import signal
 import sys
@@ -48,12 +48,54 @@ COMMANDS = [
     BotCommand(command='subscribe', description='Подписаться на уведомления о погоде'),
     BotCommand(command='unsubscribe', description='Отписаться от уведомлений'),
     BotCommand(command='stats', description='Статистика погоды'),
-    BotCommand(command='shelter', description='Найти укрытие от непогоды')
+    BotCommand(command='shelter', description='Найти укрытие от непогоды'),
+    BotCommand(command='preferences', description='Настройка умных уведомлений'),
+    BotCommand(command='activities', description='Настройка предпочитаемых активностей'),
+    BotCommand(command='notifytime', description='Установить время уведомлений')
 ]
 
 # Добавим глобальные переменные для хранения подписок и статистики
 weather_subscriptions = defaultdict(list)  # {user_id: [(city, lat, lon), ...]}
 weather_stats = defaultdict(lambda: defaultdict(list))  # {city: {'temp': [], 'humidity': [], ...}}
+
+# Настройки пользователей для умных уведомлений
+user_preferences = defaultdict(lambda: {
+    'activities': [],  # Список предпочитаемых активностей
+    'notification_time': '09:00',  # Время ежедневных уведомлений
+    'temp_range': {'min': 15, 'max': 25},  # Комфортный диапазон температур
+    'notify_changes': True,  # Уведомлять о резких изменениях погоды
+    'rain_alerts': True,  # Уведомления о дожде
+    'wind_threshold': 10,  # Порог скорости ветра для уведомлений
+    'uv_alerts': True,  # Уведомления об УФ-индексе
+})
+
+# Активности и их оптимальные условия
+ACTIVITIES = {
+    'running': {
+        'temp_range': (5, 20),
+        'wind_max': 5,
+        'no_rain': True,
+        'description': 'бега'
+    },
+    'cycling': {
+        'temp_range': (10, 25),
+        'wind_max': 7,
+        'no_rain': True,
+        'description': 'велопрогулки'
+    },
+    'walking': {
+        'temp_range': (15, 25),
+        'wind_max': 10,
+        'no_rain': True,
+        'description': 'прогулки'
+    },
+    'picnic': {
+        'temp_range': (20, 27),
+        'wind_max': 5,
+        'no_rain': True,
+        'description': 'пикника'
+    }
+}
 
 def get_clothing_recommendations(weather_data):
     """Формирует рекомендации по одежде на основе погодных условий"""
@@ -284,7 +326,10 @@ async def start_command(message: Message):
         '10. Подписаться на уведомления о погоде (/subscribe город)\n'
         '11. Отписаться от уведомлений (/unsubscribe город)\n'
         '12. Получить статистику погоды (/stats город)\n'
-        '13. Найти укрытие от непогоды (/shelter)\n\n'
+        '13. Найти укрытие от непогоды (/shelter)\n'
+        '14. Настроить умные уведомления (/preferences)\n'
+        '15. Настроить предпочитаемые активности (/activities)\n'
+        '16. Установить время уведомлений (/notifytime)\n\n'
         'Используйте кнопку ниже, чтобы отправить свою геолокацию!',
         reply_markup=create_main_keyboard()
     )
@@ -306,7 +351,10 @@ async def help_command(message: Message):
         '10. /unsubscribe ГОРОД - отписаться от уведомлений\n'
         '11. /stats ГОРОД - статистика погоды\n'
         '12. /shelter - найти укрытие от непогоды\n'
-        '13. Нажмите кнопку "📍 Отправить геолокацию" для погоды в вашем месте\n\n'
+        '13. /preferences - настроить умные уведомления\n'
+        '14. /activities - настроить предпочитаемые активности\n'
+        '15. /notifytime - установить время уведомлений\n'
+        '16. Нажмите кнопку "📍 Отправить геолокацию" для погоды в вашем месте\n\n'
         'Примеры:\n'
         '- "Москва" - текущая погода\n'
         '- "/forecast Париж" - прогноз на 5 дней\n'
@@ -1259,15 +1307,294 @@ def load_subscriptions():
     except Exception as e:
         logging.error(f"Error loading subscriptions: {e}")
 
+def save_user_preferences():
+    """Сохраняет настройки пользователей в файл"""
+    with open('user_preferences.json', 'w', encoding='utf-8') as f:
+        json.dump({str(k): v for k, v in user_preferences.items()}, f, ensure_ascii=False)
+
+def load_user_preferences():
+    """Загружает настройки пользователей из файла"""
+    global user_preferences
+    try:
+        if os.path.exists('user_preferences.json'):
+            with open('user_preferences.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                user_preferences.update({int(k): v for k, v in data.items()})
+    except Exception as e:
+        logging.error(f"Error loading user preferences: {e}")
+
+async def check_weather_changes(city, lat, lon, prev_temp):
+    """Проверяет резкие изменения погоды"""
+    try:
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                weather_data = await response.json()
+        
+        curr_temp = weather_data['main']['temp']
+        temp_change = abs(curr_temp - prev_temp)
+        
+        if temp_change >= 5:  # Изменение на 5°C или более
+            return f"🌡 Резкое изменение температуры в {city}: {temp_change:.1f}°C"
+        return None
+        
+    except Exception as e:
+        logging.error(f"Error checking weather changes: {e}")
+        return None
+
+async def check_activity_conditions(city, lat, lon, activities):
+    """Проверяет условия для активностей"""
+    try:
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                weather_data = await response.json()
+        
+        temp = weather_data['main']['temp']
+        wind_speed = weather_data['wind']['speed']
+        is_rain = 'rain' in weather_data
+        
+        suitable_activities = []
+        
+        for activity in activities:
+            if activity not in ACTIVITIES:
+                continue
+                
+            conditions = ACTIVITIES[activity]
+            temp_min, temp_max = conditions['temp_range']
+            
+            if (temp_min <= temp <= temp_max and
+                wind_speed <= conditions['wind_max'] and
+                (not conditions['no_rain'] or not is_rain)):
+                suitable_activities.append(conditions['description'])
+        
+        if suitable_activities:
+            return f"🎯 Отличные условия в {city} для: {', '.join(suitable_activities)}!"
+        return None
+        
+    except Exception as e:
+        logging.error(f"Error checking activity conditions: {e}")
+        return None
+
+async def send_smart_notifications():
+    """Отправляет умные уведомления пользователям"""
+    current_hour = datetime.now().strftime('%H:00')
+    
+    for user_id, prefs in user_preferences.items():
+        if prefs['notification_time'] != current_hour:
+            continue
+            
+        try:
+            for city, lat, lon in weather_subscriptions[user_id]:
+                notifications = []
+                
+                # Проверяем условия для активностей
+                if prefs['activities']:
+                    activity_notice = await check_activity_conditions(city, lat, lon, prefs['activities'])
+                    if activity_notice:
+                        notifications.append(activity_notice)
+                
+                # Получаем текущую погоду
+                weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(weather_url) as response:
+                        weather_data = await response.json()
+                
+                temp = weather_data['main']['temp']
+                
+                # Проверяем температурный диапазон
+                if not (prefs['temp_range']['min'] <= temp <= prefs['temp_range']['max']):
+                    notifications.append(
+                        f"🌡 Температура в {city} ({temp:.1f}°C) вне вашего комфортного диапазона "
+                        f"({prefs['temp_range']['min']}°C - {prefs['temp_range']['max']}°C)"
+                    )
+                
+                # Проверяем ветер
+                wind_speed = weather_data['wind']['speed']
+                if wind_speed > prefs['wind_threshold']:
+                    notifications.append(f"💨 Сильный ветер в {city}: {wind_speed} м/с")
+                
+                # Проверяем дождь
+                if prefs['rain_alerts'] and 'rain' in weather_data:
+                    rain = weather_data['rain'].get('1h', 0)
+                    if rain > 0:
+                        notifications.append(f"🌧 Ожидается дождь в {city}: {rain} мм/ч")
+                
+                if notifications:
+                    await bot.send_message(
+                        user_id,
+                        "🔔 Умные уведомления:\n\n" + "\n\n".join(notifications)
+                    )
+                    
+        except Exception as e:
+            logging.error(f"Error sending smart notifications to user {user_id}: {e}")
+
+@dp.message(Command('preferences'))
+async def preferences_command(message: Message):
+    """Настройка предпочтений пользователя"""
+    user_id = message.from_user.id
+    
+    # Создаем клавиатуру с настройками
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🌡 Температурный диапазон",
+                    callback_data="set_temp_range"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🌧 Уведомления о дожде",
+                    callback_data="toggle_rain"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💨 Порог скорости ветра",
+                    callback_data="set_wind"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⚡️ Уведомления о резких изменениях",
+                    callback_data="toggle_changes"
+                )
+            ]
+        ]
+    )
+    
+    prefs = user_preferences[user_id]
+    await message.answer(
+        f"⚙️ Текущие настройки уведомлений:\n\n"
+        f"🌡 Комфортная температура: {prefs['temp_range']['min']}°C - {prefs['temp_range']['max']}°C\n"
+        f"🌧 Уведомления о дожде: {'Включены' if prefs['rain_alerts'] else 'Выключены'}\n"
+        f"💨 Порог ветра: {prefs['wind_threshold']} м/с\n"
+        f"⚡️ Уведомления об изменениях: {'Включены' if prefs['notify_changes'] else 'Выключены'}\n"
+        f"⏰ Время уведомлений: {prefs['notification_time']}\n\n"
+        f"Выберите настройку для изменения:",
+        reply_markup=keyboard
+    )
+
+@dp.message(Command('activities'))
+async def activities_command(message: Message):
+    """Настройка предпочитаемых активностей"""
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🏃‍♂️ Бег",
+                    callback_data="toggle_activity_running"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚴‍♂️ Велопрогулки",
+                    callback_data="toggle_activity_cycling"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚶‍♂️ Прогулки",
+                    callback_data="toggle_activity_walking"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧺 Пикник",
+                    callback_data="toggle_activity_picnic"
+                )
+            ]
+        ]
+    )
+    
+    user_id = message.from_user.id
+    current_activities = user_preferences[user_id]['activities']
+    
+    activities_text = "Нет выбранных активностей"
+    if current_activities:
+        activities_text = "\n".join(f"• {ACTIVITIES[act]['description']}" for act in current_activities)
+    
+    await message.answer(
+        f"🎯 Выберите интересующие вас активности, и я буду уведомлять "
+        f"вас когда погодные условия будут подходящими.\n\n"
+        f"Текущие активности:\n{activities_text}",
+        reply_markup=keyboard
+    )
+
+@dp.message(Command('notifytime'))
+async def notifytime_command(message: Message):
+    """Установка времени уведомлений"""
+    try:
+        time_str = message.text.split(' ', 1)[1]
+        # Проверяем формат времени
+        try:
+            hour = int(time_str.split(':')[0])
+            if not (0 <= hour <= 23):
+                raise ValueError
+            new_time = f"{hour:02d}:00"
+        except:
+            await message.answer(
+                "Пожалуйста, укажите время в формате ЧЧ:00\n"
+                "Например: /notifytime 09:00"
+            )
+            return
+        
+        user_id = message.from_user.id
+        user_preferences[user_id]['notification_time'] = new_time
+        save_user_preferences()
+        
+        await message.answer(f"✅ Время уведомлений установлено на {new_time}")
+        
+    except IndexError:
+        await message.answer(
+            "Пожалуйста, укажите время после команды.\n"
+            "Например: /notifytime 09:00"
+        )
+
+@dp.callback_query(lambda c: c.data.startswith('toggle_activity_'))
+async def process_activity_toggle(callback_query: types.CallbackQuery):
+    """Обработка переключения активностей"""
+    activity = callback_query.data.replace('toggle_activity_', '')
+    user_id = callback_query.from_user.id
+    
+    if activity in user_preferences[user_id]['activities']:
+        user_preferences[user_id]['activities'].remove(activity)
+        status = 'удалена из'
+    else:
+        user_preferences[user_id]['activities'].append(activity)
+        status = 'добавлена в'
+    
+    save_user_preferences()
+    
+    await callback_query.answer(
+        f"Активность {ACTIVITIES[activity]['description']} {status} список"
+    )
+    
+    # Обновляем сообщение с текущим списком активностей
+    current_activities = user_preferences[user_id]['activities']
+    activities_text = "Нет выбранных активностей"
+    if current_activities:
+        activities_text = "\n".join(f"• {ACTIVITIES[act]['description']}" for act in current_activities)
+    
+    await callback_query.message.edit_text(
+        f"🎯 Выберите интересующие вас активности, и я буду уведомлять "
+        f"вас когда погодные условия будут подходящими.\n\n"
+        f"Текущие активности:\n{activities_text}",
+        reply_markup=callback_query.message.reply_markup
+    )
+
 async def main():
     """Start the bot."""
     try:
-        # Загружаем сохраненные подписки
+        # Загружаем сохраненные подписки и настройки
         load_subscriptions()
+        load_user_preferences()
         
-        # Создаем планировщик для проверки погоды
+        # Создаем планировщик
         scheduler = AsyncIOScheduler()
         scheduler.add_job(send_weather_alerts, 'interval', minutes=30)
+        scheduler.add_job(send_smart_notifications, 'interval', minutes=60)  # Проверяем каждый час
         scheduler.start()
         
         # Создаем веб-приложение
