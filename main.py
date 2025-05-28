@@ -13,6 +13,7 @@ import sys
 from aiohttp import web  # Добавляем импорт aiohttp
 import aiohttp
 import math  # Добавляем импорт math
+import googlemaps
 
 # Load environment variables
 load_dotenv()
@@ -26,10 +27,14 @@ logging.basicConfig(
 # Get environment variables
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 
 # Initialize bot and dispatcher
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+
+# Initialize Google Maps client
+gmaps = googlemaps.Client(key=GOOGLE_API_KEY)
 
 # Bot commands for menu
 COMMANDS = [
@@ -150,13 +155,23 @@ async def get_precipitation_map(lat, lon, zoom=8):
             f"?appid={OPENWEATHER_API_KEY}"
         )
         
-        # Проверяем доступность тайла
+        logging.info(f"Requesting precipitation map: {map_url}")
+        
+        # Проверяем доступность тайла и его содержимое
         async with aiohttp.ClientSession() as session:
             async with session.get(map_url) as response:
                 if response.status == 200:
+                    # Проверяем размер ответа
+                    content = await response.read()
+                    if len(content) < 100:  # Если картинка слишком маленькая, вероятно это пустой тайл
+                        logging.warning(f"Tile response too small: {len(content)} bytes")
+                        # Попробуем уменьшить зум для получения более общей картины
+                        if zoom > 4:
+                            return await get_precipitation_map(lat, lon, zoom - 2)
+                        return None
                     return map_url
                 else:
-                    logging.error(f"Failed to fetch tile: {response.status}")
+                    logging.error(f"Failed to fetch tile: {response.status}, {await response.text()}")
                     return None
     except Exception as e:
         logging.error(f"Error fetching precipitation map: {e}")
@@ -703,33 +718,48 @@ async def rain_map_command(message: Message):
         lat = geo_data[0]['lat']
         lon = geo_data[0]['lon']
         
+        # Сначала проверим наличие осадков в регионе
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                weather_data = await response.json()
+        
         # Получаем URL карты осадков
         map_url = await get_precipitation_map(lat, lon)
         
         if map_url:
-            # Создаем inline клавиатуру для изменения масштаба
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(text="Приблизить", callback_data=f"zoom_in_{city}"),
-                        InlineKeyboardButton(text="Отдалить", callback_data=f"zoom_out_{city}")
-                    ]
-                ]
-            )
-            
-            await message.answer_photo(
-                map_url,
-                caption=f"🗺 Карта осадков для города {city}\n"
-                        f"🔵 Синий цвет - дождь\n"
-                        f"🟣 Фиолетовый цвет - смешанные осадки\n"
-                        f"⚪️ Белый цвет - снег",
-                reply_markup=keyboard
-            )
+            try:
+                # Пробуем отправить фото
+                await message.answer_photo(
+                    map_url,
+                    caption=f"🗺 Карта осадков для города {city}\n"
+                            f"🔵 Синий цвет - дождь\n"
+                            f"🟣 Фиолетовый цвет - смешанные осадки\n"
+                            f"⚪️ Белый цвет - снег"
+                )
+            except Exception as photo_error:
+                logging.error(f"Error sending photo: {photo_error}")
+                # Если не получилось отправить фото, отправим хотя бы текущие данные об осадках
+                if 'rain' in weather_data or 'snow' in weather_data:
+                    precipitation_info = "Текущие осадки:\n"
+                    if 'rain' in weather_data:
+                        precipitation_info += f"🌧 Дождь: {weather_data['rain'].get('1h', 0)} мм/ч\n"
+                    if 'snow' in weather_data:
+                        precipitation_info += f"🌨 Снег: {weather_data['snow'].get('1h', 0)} мм/ч\n"
+                    await message.answer(precipitation_info)
+                else:
+                    await message.answer("В данный момент осадков нет.")
         else:
-            await message.answer(
-                "Извините, не удалось получить карту осадков. "
-                "Пожалуйста, попробуйте позже."
-            )
+            # Если карта недоступна, отправим информацию о текущей погоде
+            weather_info = f"Текущая погода в {city}:\n"
+            weather_info += f"☁️ {weather_data['weather'][0]['description']}\n"
+            if 'rain' in weather_data:
+                weather_info += f"🌧 Дождь: {weather_data['rain'].get('1h', 0)} мм/ч\n"
+            if 'snow' in weather_data:
+                weather_info += f"🌨 Снег: {weather_data['snow'].get('1h', 0)} мм/ч\n"
+            if 'rain' not in weather_data and 'snow' not in weather_data:
+                weather_info += "Осадков нет"
+            await message.answer(weather_info)
             
     except Exception as e:
         logging.error(f"Error in rain_map_command: {e}")
