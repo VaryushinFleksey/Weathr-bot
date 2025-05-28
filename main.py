@@ -539,88 +539,27 @@ async def get_weather(message: Message):
             "Пожалуйста, попробуйте позже."
         )
 
-async def on_startup(app):
-    """Действия при запуске бота"""
-    webhook_url = os.environ.get('WEBHOOK_URL')
-    if not webhook_url:
-        logging.error("WEBHOOK_URL не установлен!")
-        sys.exit(1)
-        
-    webhook_path = webhook_url.rstrip('/') + '/webhook'
-    
-    # Удаляем старый вебхук и устанавливаем новый
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(webhook_path)
-    
-    # Устанавливаем команды бота
-    await bot.set_my_commands(COMMANDS)
-    
-    webhook_info = await bot.get_webhook_info()
-    logging.info(f"Вебхук установлен: {webhook_info.url}")
-
-async def on_shutdown(app):
-    """Действия при остановке бота"""
-    # Удаляем вебхук при выключении
-    await bot.delete_webhook()
-    logging.info("Вебхук удален")
-
-def setup_routes(app):
-    """Настройка маршрутов"""
-    app.router.add_post('/webhook', handle_webhook)
-    app.router.add_get('/', lambda r: web.Response(text="Бот работает!"))
-
-async def handle_webhook(request):
-    """Обработчик вебхуков от Telegram"""
-    try:
-        data = await request.json()
-        update = types.Update(**data)
-        await dp.feed_update(bot=bot, update=update)
-        return web.Response(text='ok', status=200)
-    except Exception as e:
-        logging.error(f"Ошибка обработки вебхука: {e}")
-        return web.Response(text='error', status=500)
-
 async def main():
-    """Запуск приложения"""
-    logging.info("Запуск бота...")
-    
-    # Создаем приложение
-    app = web.Application()
-    
-    # Добавляем обработчики запуска и остановки
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-    
-    # Настраиваем маршруты
-    setup_routes(app)
-    
-    # Получаем порт
-    port = int(os.environ.get('PORT', 8080))
-    
-    # Запускаем приложение
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    
+    """Start the bot."""
+    # Set bot commands
     try:
-        await site.start()
-        logging.info(f"Бот запущен на порту {port}")
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_my_commands(COMMANDS)
+        print("Bot commands updated successfully")
         
-        # Держим приложение запущенным
-        while True:
-            await asyncio.sleep(3600)
-            
+        # Start polling
+        print("Бот запущен")
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
+        print(f"Ошибка: {e}")
         raise
-    finally:
-        await runner.cleanup()
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info('Бот остановлен')
+        print('Бот остановлен')
     except Exception as e:
-        logging.error(f"Критическая ошибка: {e}")
+        print(f"Критическая ошибка: {e}")
         sys.exit(1) 
