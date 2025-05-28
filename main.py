@@ -3001,6 +3001,7 @@ def save_subscription(user_id: int, city: str, lat: float, lon: float):
             'INSERT OR REPLACE INTO subscriptions (user_id, city, lat, lon) VALUES (?, ?, ?, ?)',
             (user_id, city, lat, lon)
         )
+        conn.commit()
 
 def get_user_subscriptions(user_id: int) -> list:
     """Получает список подписок пользователя"""
@@ -3027,6 +3028,7 @@ def save_user_preferences_db(user_id: int, preferences: dict):
                 json.dumps(preferences['activities'])
             )
         )
+        conn.commit()
 
 def get_user_preferences_db(user_id: int) -> dict:
     """Получает настройки пользователя из базы данных"""
@@ -3041,7 +3043,7 @@ def get_user_preferences_db(user_id: int) -> dict:
                 'temp_range': {'min': row[2], 'max': row[3]},
                 'wind_threshold': row[4],
                 'rain_alerts': bool(row[5]),
-                'activities': json.loads(row[6])
+                'activities': json.loads(row[6]) if row[6] else []
             }
         return None
 
@@ -3054,29 +3056,28 @@ def save_weather_stats(city: str, temp: float, humidity: int, wind_speed: float)
             'INSERT INTO weather_stats (city, timestamp, temperature, humidity, wind_speed) VALUES (?, ?, ?, ?, ?)',
             (city, timestamp, temp, humidity, wind_speed)
         )
+        conn.commit()
 
 def get_weather_stats(city: str, hours: int = 24) -> dict:
-    """Получает статистику погоды за указанный период"""
+    """Получает статистику погоды за последние hours часов"""
     with get_db() as conn:
         cursor = conn.cursor()
-        timestamp = int(time_module.time() - hours * 3600)
-        cursor.execute(
-            '''SELECT AVG(temperature), MIN(temperature), MAX(temperature), AVG(humidity), AVG(wind_speed)
-               FROM weather_stats 
-               WHERE city = ? AND timestamp > ?''',
-            (city, timestamp)
-        )
-        row = cursor.fetchone()
+        timestamp = int(time_module.time()) - hours * 3600
+        cursor.execute('''
+            SELECT temperature, humidity, wind_speed 
+            FROM weather_stats 
+            WHERE city = ? AND timestamp > ?
+        ''', (city, timestamp))
+        rows = cursor.fetchall()
         
-        if row and row[0] is not None:
-            return {
-                'temp_avg': row[0],
-                'temp_min': row[1],
-                'temp_max': row[2],
-                'humidity_avg': row[3],
-                'wind_speed_avg': row[4]
-            }
-        return None
+        if not rows:
+            return None
+            
+        return {
+            'temperature': [row[0] for row in rows],
+            'humidity': [row[1] for row in rows],
+            'wind_speed': [row[2] for row in rows]
+        }
 
 # Инициализируем базу данных при запуске
 init_db()
