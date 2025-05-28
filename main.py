@@ -1962,7 +1962,7 @@ async def process_activity_callback(callback_query: types.CallbackQuery):
 
 async def main():
     """Start the bot."""
-    global scheduler
+    global scheduler, app, runner
     
     try:
         # Настраиваем логирование
@@ -1980,20 +1980,47 @@ async def main():
         scheduler.start()
         logger.info("Scheduler started")
         
-        # Удаляем webhook перед запуском polling
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook deleted")
+        # Создаем веб-приложение
+        app = web.Application()
         
-        # Устанавливаем команды бота
-        await bot.set_my_commands(COMMANDS)
-        logger.info("Bot commands updated successfully")
+        # Добавляем обработчики
+        webhook_path = f"/webhook/{TELEGRAM_BOT_TOKEN}"
+        app.router.add_post(webhook_path, process_update)
+        app.router.add_get("/", healthcheck)
         
-        # Запускаем бота в режиме polling
-        logger.info("Starting bot polling...")
-        await dp.start_polling(bot)
+        # Добавляем обработчики событий приложения
+        app.on_startup.append(on_startup)
+        app.on_shutdown.append(on_shutdown)
+        
+        # Получаем порт из переменных окружения
+        port = int(os.environ.get('PORT', 8080))
+        
+        # Запускаем веб-сервер
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        
+        # Устанавливаем обработчики сигналов
+        for signal_name in ('SIGINT', 'SIGTERM'):
+            try:
+                signal.signal(
+                    getattr(signal, signal_name),
+                    lambda s, f: asyncio.create_task(shutdown(dp))
+                )
+            except AttributeError:
+                pass
+        
+        # Запускаем бота
+        await site.start()
+        logger.info(f"Bot started on port {port}")
+        
+        # Ждем завершения
+        await asyncio.Event().wait()
         
     except Exception as e:
         log_error(e, "Critical error in main")
+        if runner:
+            await runner.cleanup()
         if scheduler:
             scheduler.shutdown()
         sys.exit(1)
