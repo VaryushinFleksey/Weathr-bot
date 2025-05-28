@@ -12,6 +12,7 @@ import signal
 import sys
 from aiohttp import web  # Добавляем импорт aiohttp
 import aiohttp
+import math  # Добавляем импорт math
 
 # Load environment variables
 load_dotenv()
@@ -129,21 +130,33 @@ def get_clothing_recommendations(weather_data):
     
     return recommendations
 
+def lat_lon_to_tile(lat, lon, zoom):
+    """Конвертирует координаты в номера тайлов"""
+    lat_rad = math.radians(lat)
+    n = 2.0 ** zoom
+    xtile = int((lon + 180.0) / 360.0 * n)
+    ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return xtile, ytile
+
 async def get_precipitation_map(lat, lon, zoom=8):
     """Получает карту осадков для заданных координат"""
-    # Формируем URL для карты осадков
-    map_url = (
-        f"https://tile.openweathermap.org/map/precipitation_new/{zoom}/{lat}/{lon}.png"
-        f"?appid={OPENWEATHER_API_KEY}"
-    )
-    
     try:
-        # Загружаем изображение карты
+        # Конвертируем координаты в тайлы
+        xtile, ytile = lat_lon_to_tile(lat, lon, zoom)
+        
+        # Формируем URL для карты осадков
+        map_url = (
+            f"https://tile.openweathermap.org/map/precipitation_new/{zoom}/{xtile}/{ytile}.png"
+            f"?appid={OPENWEATHER_API_KEY}"
+        )
+        
+        # Проверяем доступность тайла
         async with aiohttp.ClientSession() as session:
             async with session.get(map_url) as response:
                 if response.status == 200:
                     return map_url
                 else:
+                    logging.error(f"Failed to fetch tile: {response.status}")
                     return None
     except Exception as e:
         logging.error(f"Error fetching precipitation map: {e}")
