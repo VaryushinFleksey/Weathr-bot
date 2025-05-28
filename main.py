@@ -10,16 +10,9 @@ from datetime import datetime
 import pytz
 import signal
 import sys
-from aiohttp import web  # Добавляем импорт aiohttp
+from aiohttp import web
 import aiohttp
-import math  # Добавляем импорт math
-
-# Опционально импортируем googlemaps
-try:
-    import googlemaps
-    GOOGLE_MAPS_AVAILABLE = True
-except ImportError:
-    GOOGLE_MAPS_AVAILABLE = False
+import math
 
 # Load environment variables
 load_dotenv()
@@ -33,20 +26,10 @@ logging.basicConfig(
 # Get environment variables
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 
 # Initialize bot and dispatcher
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
-
-# Initialize Google Maps client only if API key is available
-gmaps = None
-if GOOGLE_MAPS_AVAILABLE and GOOGLE_API_KEY:
-    try:
-        gmaps = googlemaps.Client(key=GOOGLE_API_KEY)
-        logging.info("Google Maps API initialized successfully")
-    except Exception as e:
-        logging.warning(f"Failed to initialize Google Maps API: {e}")
 
 # Bot commands for menu
 COMMANDS = [
@@ -169,21 +152,18 @@ async def get_precipitation_map(lat, lon, zoom=8):
         
         logging.info(f"Requesting precipitation map: {map_url}")
         
-        # Проверяем доступность тайла и его содержимое
+        # Проверяем доступность тайла
         async with aiohttp.ClientSession() as session:
             async with session.get(map_url) as response:
                 if response.status == 200:
-                    # Проверяем размер ответа
                     content = await response.read()
-                    if len(content) < 100:  # Если картинка слишком маленькая, вероятно это пустой тайл
-                        logging.warning(f"Tile response too small: {len(content)} bytes")
-                        # Попробуем уменьшить зум для получения более общей картины
-                        if zoom > 4:
-                            return await get_precipitation_map(lat, lon, zoom - 2)
+                    if len(content) > 1000:  # Проверяем, что получили реальное изображение
+                        return map_url
+                    else:
+                        logging.warning(f"Empty or invalid tile received: {len(content)} bytes")
                         return None
-                    return map_url
                 else:
-                    logging.error(f"Failed to fetch tile: {response.status}, {await response.text()}")
+                    logging.error(f"Failed to fetch tile: {response.status}")
                     return None
     except Exception as e:
         logging.error(f"Error fetching precipitation map: {e}")
@@ -426,36 +406,131 @@ async def air_quality_command(message: Message):
             "Пожалуйста, попробуйте позже."
         )
 
+async def get_location_info(lat, lon):
+    """Получает подробную информацию о местоположении"""
+    try:
+        # Получаем информацию о местоположении через reverse geocoding
+        reverse_url = f"http://api.openweathermap.org/geo/1.0/reverse?lat={lat}&lon={lon}&limit=1&appid={OPENWEATHER_API_KEY}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(reverse_url) as response:
+                location_data = await response.json()
+                
+        if not location_data:
+            return "Неизвестное место"
+            
+        # Формируем название места
+        location = location_data[0]
+        place_name = []
+        
+        if 'local_names' in location and 'ru' in location['local_names']:
+            place_name.append(location['local_names']['ru'])
+        else:
+            place_name.append(location.get('name', ''))
+            
+        if location.get('state'):
+            if 'local_names' in location and 'ru' in location['local_names']:
+                place_name.append(location['local_names']['ru'])
+            else:
+                place_name.append(location['state'])
+                
+        if location.get('country'):
+            place_name.append(location['country'])
+            
+        return ", ".join(filter(None, place_name))
+    except Exception as e:
+        logging.error(f"Error getting location info: {e}")
+        return "Неизвестное место"
+
 @dp.message(lambda message: message.location is not None)
 async def handle_location(message: Message):
-    """Handle received location."""
+    """Обработка полученной геолокации"""
     try:
         lat = message.location.latitude
         lon = message.location.longitude
         
-        # Get weather data
+        # Получаем название места
+        location_name = await get_location_info(lat, lon)
+        
+        # Получаем погодные данные
         weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-        weather_response = requests.get(weather_url)
-        weather_data = weather_response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                if response.status != 200:
+                    await message.answer(
+                        "Извините, не удалось получить данные о погоде. "
+                        "Пожалуйста, попробуйте позже."
+                    )
+                    return
+                weather_data = await response.json()
         
-        # Get city name from coordinates
-        city_name = weather_data['name']
-        
-        # Check for weather alerts
+        # Проверяем наличие предупреждений
         alerts = check_weather_alerts(weather_data)
         
-        # Format and send detailed weather information
-        detailed_message = format_detailed_weather(weather_data, city_name)
+        # Форматируем сообщение с информацией о местоположении
+        response_message = f"📍 Определено местоположение: {location_name}\n\n"
+        response_message += format_detailed_weather(weather_data, location_name)
+        
         if alerts:
-            detailed_message += "\n\n" + "\n".join(alerts)
-        await message.answer(detailed_message)
+            response_message += "\n\n⚠️ Предупреждения:\n" + "\n".join(alerts)
+        
+        # Отправляем ответ с информацией о погоде
+        await message.answer(response_message)
+        
+        # Если есть осадки, предлагаем посмотреть карту
+        if 'rain' in weather_data or 'snow' in weather_data:
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="Показать карту осадков",
+                        callback_data=f"show_rain_map_{lat}_{lon}"
+                    )
+                ]]
+            )
+            await message.answer(
+                "Хотите посмотреть карту осадков для вашего местоположения?",
+                reply_markup=keyboard
+            )
         
     except Exception as e:
         logging.error(f"Error handling location: {e}")
         await message.answer(
-            "Извините, произошла ошибка при определении погоды по вашей геолокации. "
-            "Пожалуйста, попробуйте позже."
+            "Извините, произошла ошибка при определении местоположения. "
+            "Пожалуйста, попробуйте позже или введите название города вручную."
         )
+
+# Добавляем обработчик для кнопки показа карты осадков
+@dp.callback_query(lambda c: c.data.startswith('show_rain_map_'))
+async def show_rain_map(callback_query: types.CallbackQuery):
+    """Показывает карту осадков для сохраненных координат"""
+    try:
+        # Извлекаем координаты из callback_data
+        _, lat, lon = callback_query.data.split('_')[2:]
+        lat, lon = float(lat), float(lon)
+        
+        # Получаем название места
+        location_name = await get_location_info(lat, lon)
+        
+        # Получаем карту осадков
+        map_url = await get_precipitation_map(lat, lon)
+        
+        if map_url:
+            await callback_query.message.answer_photo(
+                map_url,
+                caption=f"🗺 Карта осадков для местоположения: {location_name}"
+            )
+        else:
+            await callback_query.message.answer(
+                "Извините, карта осадков сейчас недоступна для этого местоположения."
+            )
+        
+        await callback_query.answer()
+        
+    except Exception as e:
+        logging.error(f"Error showing rain map: {e}")
+        await callback_query.message.answer(
+            "Извините, произошла ошибка при получении карты осадков."
+        )
+        await callback_query.answer()
 
 @dp.message(Command('compare'))
 async def compare_command(message: Message):
@@ -707,7 +782,7 @@ async def wear_command(message: Message):
 
 @dp.message(Command('rain'))
 async def rain_map_command(message: Message):
-    """Отправляет карту осадков для указанного города"""
+    """Отправляет информацию об осадках для указанного города"""
     try:
         city = message.text.split(' ', 1)[1]
     except IndexError:
@@ -720,8 +795,9 @@ async def rain_map_command(message: Message):
     try:
         # Получаем координаты города
         geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
-        geo_response = requests.get(geo_url)
-        geo_data = geo_response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(geo_url) as response:
+                geo_data = await response.json()
         
         if not geo_data:
             await message.answer("Извините, не могу найти такой город. Попробуйте другой.")
@@ -730,53 +806,48 @@ async def rain_map_command(message: Message):
         lat = geo_data[0]['lat']
         lon = geo_data[0]['lon']
         
-        # Сначала проверим наличие осадков в регионе
+        # Получаем текущие данные о погоде
         weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
         async with aiohttp.ClientSession() as session:
             async with session.get(weather_url) as response:
                 weather_data = await response.json()
+
+        # Формируем базовое сообщение о погоде
+        weather_message = f"🌍 Информация об осадках в городе {city}:\n\n"
+        weather_message += f"☁️ {weather_data['weather'][0]['description']}\n"
         
-        # Получаем URL карты осадков
+        # Добавляем информацию об осадках
+        if 'rain' in weather_data:
+            weather_message += f"🌧 Дождь: {weather_data['rain'].get('1h', 0)} мм/ч\n"
+        if 'snow' in weather_data:
+            weather_message += f"🌨 Снег: {weather_data['snow'].get('1h', 0)} мм/ч\n"
+        
+        # Добавляем информацию о влажности и облачности
+        weather_message += f"💧 Влажность: {weather_data['main']['humidity']}%\n"
+        weather_message += f"☁️ Облачность: {weather_data['clouds']['all']}%\n"
+        
+        # Пытаемся получить карту осадков
         map_url = await get_precipitation_map(lat, lon)
         
         if map_url:
             try:
-                # Пробуем отправить фото
                 await message.answer_photo(
                     map_url,
-                    caption=f"🗺 Карта осадков для города {city}\n"
-                            f"🔵 Синий цвет - дождь\n"
-                            f"🟣 Фиолетовый цвет - смешанные осадки\n"
-                            f"⚪️ Белый цвет - снег"
+                    caption=weather_message + "\n🗺 Карта осадков:"
                 )
-            except Exception as photo_error:
-                logging.error(f"Error sending photo: {photo_error}")
-                # Если не получилось отправить фото, отправим хотя бы текущие данные об осадках
-                if 'rain' in weather_data or 'snow' in weather_data:
-                    precipitation_info = "Текущие осадки:\n"
-                    if 'rain' in weather_data:
-                        precipitation_info += f"🌧 Дождь: {weather_data['rain'].get('1h', 0)} мм/ч\n"
-                    if 'snow' in weather_data:
-                        precipitation_info += f"🌨 Снег: {weather_data['snow'].get('1h', 0)} мм/ч\n"
-                    await message.answer(precipitation_info)
-                else:
-                    await message.answer("В данный момент осадков нет.")
+            except Exception as e:
+                logging.error(f"Error sending precipitation map: {e}")
+                await message.answer(weather_message + "\n\nК сожалению, карта осадков сейчас недоступна.")
         else:
-            # Если карта недоступна, отправим информацию о текущей погоде
-            weather_info = f"Текущая погода в {city}:\n"
-            weather_info += f"☁️ {weather_data['weather'][0]['description']}\n"
-            if 'rain' in weather_data:
-                weather_info += f"🌧 Дождь: {weather_data['rain'].get('1h', 0)} мм/ч\n"
-            if 'snow' in weather_data:
-                weather_info += f"🌨 Снег: {weather_data['snow'].get('1h', 0)} мм/ч\n"
+            # Если карта недоступна, отправляем только текстовую информацию
             if 'rain' not in weather_data and 'snow' not in weather_data:
-                weather_info += "Осадков нет"
-            await message.answer(weather_info)
+                weather_message += "\n✨ В данный момент осадков нет"
+            await message.answer(weather_message)
             
     except Exception as e:
         logging.error(f"Error in rain_map_command: {e}")
         await message.answer(
-            "Извините, произошла ошибка при получении карты осадков. "
+            "Извините, произошла ошибка при получении информации об осадках. "
             "Пожалуйста, попробуйте позже."
         )
 
