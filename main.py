@@ -39,6 +39,188 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Database configuration
+DB_FILE = 'weather_bot.db'
+
+@contextmanager
+def get_db():
+    """Контекстный менеджер для работы с базой данных"""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def init_db():
+    """Инициализация базы данных"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # Создаем таблицу пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                language_code TEXT,
+                is_premium BOOLEAN,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Создаем таблицу подписок
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id INTEGER,
+                city TEXT,
+                lat REAL,
+                lon REAL,
+                PRIMARY KEY (user_id, city)
+            )
+        ''')
+        
+        # Создаем таблицу настроек пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id INTEGER PRIMARY KEY,
+                notification_time TEXT,
+                temp_min INTEGER,
+                temp_max INTEGER,
+                wind_threshold INTEGER,
+                rain_alerts BOOLEAN,
+                activities TEXT
+            )
+        ''')
+        
+        # Создаем таблицу статистики погоды
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS weather_stats (
+                city TEXT,
+                timestamp INTEGER,
+                temperature REAL,
+                humidity INTEGER,
+                wind_speed REAL,
+                PRIMARY KEY (city, timestamp)
+            )
+        ''')
+        conn.commit()
+        logger.info("Database initialized successfully")
+
+def save_user_info(user: types.User):
+    """Сохраняет информацию о пользователе в базу данных"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO users (
+                    user_id, username, first_name, last_name,
+                    language_code, is_premium, joined_at
+                ) VALUES (?, ?, ?, ?, ?, ?, COALESCE(
+                    (SELECT joined_at FROM users WHERE user_id = ?),
+                    CURRENT_TIMESTAMP
+                ))
+            ''', (
+                user.id,
+                user.username,
+                user.first_name,
+                user.last_name,
+                user.language_code,
+                user.is_premium,
+                user.id
+            ))
+            conn.commit()
+            logger.info(f"User info saved: {user.id} ({user.username or user.first_name})")
+    except Exception as e:
+        log_error(e, f"Error saving user info for user {user.id}")
+        raise
+
+def save_subscription(user_id: int, city: str, lat: float, lon: float):
+    """Сохраняет подписку в базу данных"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT OR REPLACE INTO subscriptions (user_id, city, lat, lon) VALUES (?, ?, ?, ?)',
+            (user_id, city, lat, lon)
+        )
+        conn.commit()
+
+def get_user_subscriptions(user_id: int) -> list:
+    """Получает список подписок пользователя"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT city, lat, lon FROM subscriptions WHERE user_id = ?', (user_id,))
+        return cursor.fetchall()
+
+def save_user_preferences_db(user_id: int, preferences: dict):
+    """Сохраняет настройки пользователя в базу данных"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT OR REPLACE INTO user_preferences 
+               (user_id, notification_time, temp_min, temp_max, wind_threshold, rain_alerts, activities)
+               VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (
+                user_id,
+                preferences['notification_time'],
+                preferences['temp_range']['min'],
+                preferences['temp_range']['max'],
+                preferences['wind_threshold'],
+                preferences['rain_alerts'],
+                json.dumps(preferences['activities'])
+            )
+        )
+        conn.commit()
+
+def get_user_preferences_db(user_id: int) -> dict:
+    """Получает настройки пользователя из базы данных"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM user_preferences WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        
+        if row:
+            return {
+                'notification_time': row[1],
+                'temp_range': {'min': row[2], 'max': row[3]},
+                'wind_threshold': row[4],
+                'rain_alerts': bool(row[5]),
+                'activities': json.loads(row[6]) if row[6] else []
+            }
+        return None
+
+def save_weather_stats(city: str, temp: float, humidity: int, wind_speed: float):
+    """Сохраняет статистику погоды"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        timestamp = int(time_module.time())
+        cursor.execute(
+            'INSERT INTO weather_stats (city, timestamp, temperature, humidity, wind_speed) VALUES (?, ?, ?, ?, ?)',
+            (city, timestamp, temp, humidity, wind_speed)
+        )
+        conn.commit()
+
+def get_weather_stats(city: str, hours: int = 24) -> dict:
+    """Получает статистику погоды за последние hours часов"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        timestamp = int(time_module.time()) - hours * 3600
+        cursor.execute('''
+            SELECT temperature, humidity, wind_speed 
+            FROM weather_stats 
+            WHERE city = ? AND timestamp > ?
+        ''', (city, timestamp))
+        rows = cursor.fetchall()
+        
+        if not rows:
+            return None
+            
+        return {
+            'temperature': [row[0] for row in rows],
+            'humidity': [row[1] for row in rows],
+            'wind_speed': [row[2] for row in rows]
+        }
+
 # Database functions
 @contextmanager
 def get_db():
@@ -2932,152 +3114,6 @@ async def shelter_command(message: Message):
     except Exception as e:
         log_error(e, f"Error in shelter command for user {message.from_user.id}")
         await message.answer("😔 Произошла ошибка при поиске укрытий. Попробуйте позже.")
-
-# Database configuration
-DB_FILE = 'weather_bot.db'
-
-def init_db():
-    """Инициализация базы данных"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        # Создаем таблицу пользователей
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                language_code TEXT,
-                is_premium BOOLEAN,
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Создаем таблицу подписок
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                user_id INTEGER,
-                city TEXT,
-                lat REAL,
-                lon REAL,
-                PRIMARY KEY (user_id, city)
-            )
-        ''')
-        
-        # Создаем таблицу настроек пользователей
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_preferences (
-                user_id INTEGER PRIMARY KEY,
-                notification_time TEXT,
-                temp_min INTEGER,
-                temp_max INTEGER,
-                wind_threshold INTEGER,
-                rain_alerts BOOLEAN,
-                activities TEXT
-            )
-        ''')
-        
-        # Создаем таблицу статистики погоды
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS weather_stats (
-                city TEXT,
-                timestamp INTEGER,
-                temperature REAL,
-                humidity INTEGER,
-                wind_speed REAL,
-                PRIMARY KEY (city, timestamp)
-            )
-        ''')
-        
-        conn.commit()
-        logger.info("Database initialized successfully")
-
-def save_subscription(user_id: int, city: str, lat: float, lon: float):
-    """Сохраняет подписку в базу данных"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            'INSERT OR REPLACE INTO subscriptions (user_id, city, lat, lon) VALUES (?, ?, ?, ?)',
-            (user_id, city, lat, lon)
-        )
-        conn.commit()
-
-def get_user_subscriptions(user_id: int) -> list:
-    """Получает список подписок пользователя"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT city, lat, lon FROM subscriptions WHERE user_id = ?', (user_id,))
-        return cursor.fetchall()
-
-def save_user_preferences_db(user_id: int, preferences: dict):
-    """Сохраняет настройки пользователя в базу данных"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            '''INSERT OR REPLACE INTO user_preferences 
-               (user_id, notification_time, temp_min, temp_max, wind_threshold, rain_alerts, activities)
-               VALUES (?, ?, ?, ?, ?, ?, ?)''',
-            (
-                user_id,
-                preferences['notification_time'],
-                preferences['temp_range']['min'],
-                preferences['temp_range']['max'],
-                preferences['wind_threshold'],
-                preferences['rain_alerts'],
-                json.dumps(preferences['activities'])
-            )
-        )
-        conn.commit()
-
-def get_user_preferences_db(user_id: int) -> dict:
-    """Получает настройки пользователя из базы данных"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM user_preferences WHERE user_id = ?', (user_id,))
-        row = cursor.fetchone()
-        
-        if row:
-            return {
-                'notification_time': row[1],
-                'temp_range': {'min': row[2], 'max': row[3]},
-                'wind_threshold': row[4],
-                'rain_alerts': bool(row[5]),
-                'activities': json.loads(row[6]) if row[6] else []
-            }
-        return None
-
-def save_weather_stats(city: str, temp: float, humidity: int, wind_speed: float):
-    """Сохраняет статистику погоды"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        timestamp = int(time_module.time())
-        cursor.execute(
-            'INSERT INTO weather_stats (city, timestamp, temperature, humidity, wind_speed) VALUES (?, ?, ?, ?, ?)',
-            (city, timestamp, temp, humidity, wind_speed)
-        )
-        conn.commit()
-
-def get_weather_stats(city: str, hours: int = 24) -> dict:
-    """Получает статистику погоды за последние hours часов"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        timestamp = int(time_module.time()) - hours * 3600
-        cursor.execute('''
-            SELECT temperature, humidity, wind_speed 
-            FROM weather_stats 
-            WHERE city = ? AND timestamp > ?
-        ''', (city, timestamp))
-        rows = cursor.fetchall()
-        
-        if not rows:
-            return None
-            
-        return {
-            'temperature': [row[0] for row in rows],
-            'humidity': [row[1] for row in rows],
-            'wind_speed': [row[2] for row in rows]
-        }
 
 # Инициализируем базу данных при запуске
 init_db()
