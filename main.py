@@ -1980,6 +1980,10 @@ async def main():
         scheduler.start()
         logger.info("Scheduler started")
         
+        # Удаляем webhook перед запуском polling
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook deleted")
+        
         # Устанавливаем команды бота
         await bot.set_my_commands(COMMANDS)
         logger.info("Bot commands updated successfully")
