@@ -17,14 +17,16 @@ from urllib.parse import quote
 import json
 from collections import defaultdict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from contextlib import suppress
+from contextlib import suppress, contextmanager
 import traceback
 import functools
 from aiohttp import ClientTimeout
 from asyncio import Lock
 import time as time_module
 import sqlite3
-from contextlib import contextmanager
+
+# Database configuration
+DB_FILE = 'weather_bot.db'
 
 # Configure logging
 logging.basicConfig(
@@ -36,6 +38,100 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Database functions
+@contextmanager
+def get_db():
+    """Контекстный менеджер для работы с базой данных"""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def init_db():
+    """Инициализация базы данных"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # Создаем таблицу пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                language_code TEXT,
+                is_premium BOOLEAN,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Создаем таблицу подписок
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id INTEGER,
+                city TEXT,
+                lat REAL,
+                lon REAL,
+                PRIMARY KEY (user_id, city)
+            )
+        ''')
+        
+        # Создаем таблицу настроек пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id INTEGER PRIMARY KEY,
+                notification_time TEXT,
+                temp_min INTEGER,
+                temp_max INTEGER,
+                wind_threshold INTEGER,
+                rain_alerts BOOLEAN,
+                activities TEXT
+            )
+        ''')
+        
+        # Создаем таблицу статистики погоды
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS weather_stats (
+                city TEXT,
+                timestamp INTEGER,
+                temperature REAL,
+                humidity INTEGER,
+                wind_speed REAL,
+                PRIMARY KEY (city, timestamp)
+            )
+        ''')
+        conn.commit()
+        logger.info("Database initialized successfully")
+
+def save_user_info(user: types.User):
+    """Сохраняет информацию о пользователе в базу данных"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO users (
+                    user_id, username, first_name, last_name,
+                    language_code, is_premium, joined_at
+                ) VALUES (?, ?, ?, ?, ?, ?, COALESCE(
+                    (SELECT joined_at FROM users WHERE user_id = ?),
+                    CURRENT_TIMESTAMP
+                ))
+            ''', (
+                user.id,
+                user.username,
+                user.first_name,
+                user.last_name,
+                user.language_code,
+                user.is_premium,
+                user.id
+            ))
+            conn.commit()
+            logger.info(f"User info saved: {user.id} ({user.username or user.first_name})")
+    except Exception as e:
+        log_error(e, f"Error saving user info for user {user.id}")
+        raise
 
 # Rate limiting configuration
 RATE_LIMIT = 1  # seconds between requests
