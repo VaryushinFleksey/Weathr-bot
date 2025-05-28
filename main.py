@@ -10,6 +10,7 @@ from datetime import datetime
 import pytz
 import signal
 import sys
+from aiohttp import web  # Добавляем импорт aiohttp
 
 # Load environment variables
 load_dotenv()
@@ -35,19 +36,17 @@ COMMANDS = [
     BotCommand(command='forecast', description='Прогноз погоды на 5 дней'),
     BotCommand(command='detailed', description='Подробная информация о погоде'),
     BotCommand(command='air', description='Качество воздуха'),
-    BotCommand(command='compare', description='Сравнить погоду в двух городах')
+    BotCommand(command='compare', description='Сравнить погоду в двух городах'),
+    BotCommand(command='alerts', description='Погодные предупреждения')
 ]
 
 def create_main_keyboard():
     """Create main keyboard with location button."""
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📍 Отправить геолокацию", request_location=True)],
-            [KeyboardButton(text="ℹ️ Помощь")]
-        ],
-        resize_keyboard=True
-    )
-    return keyboard
+    keyboard = [
+        [{"text": "📍 Отправить геолокацию", "request_location": True}],
+        [{"text": "ℹ️ Помощь"}]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 def format_detailed_weather(weather_data, city_name):
     """Format detailed weather information."""
@@ -89,6 +88,44 @@ def format_detailed_weather(weather_data, city_name):
         f"☁️ Облачность: {clouds}%"
     )
 
+def check_weather_alerts(weather_data):
+    """Check for dangerous weather conditions."""
+    alerts = []
+    
+    # Check temperature
+    temp = weather_data['main']['temp']
+    if temp > 30:
+        alerts.append("🌡 Сильная жара! Избегайте длительного пребывания на солнце")
+    elif temp < -15:
+        alerts.append("❄️ Сильный мороз! Тепло оденьтесь")
+    
+    # Check wind
+    wind_speed = weather_data['wind']['speed']
+    if wind_speed > 15:
+        alerts.append(f"💨 Сильный ветер {wind_speed} м/с! Будьте осторожны на улице")
+    
+    # Check rain/snow/thunderstorm
+    if 'rain' in weather_data:
+        rain = weather_data['rain'].get('1h', 0)
+        if rain > 10:
+            alerts.append("🌧 Сильный дождь! Возьмите зонт")
+    if 'snow' in weather_data:
+        snow = weather_data['snow'].get('1h', 0)
+        if snow > 5:
+            alerts.append("🌨 Сильный снег! Возможны заносы на дорогах")
+    
+    # Check visibility
+    visibility = weather_data.get('visibility', 10000) / 1000  # convert to km
+    if visibility < 1:
+        alerts.append("🌫 Очень плохая видимость! Будьте внимательны")
+    
+    # Check weather conditions
+    weather_id = weather_data['weather'][0]['id']
+    if weather_id in range(200, 300):  # Thunderstorm
+        alerts.append("⛈ Гроза! Соблюдайте меры предосторожности")
+    
+    return alerts
+
 @dp.message(CommandStart())
 async def start_command(message: Message):
     """Send a message when the command /start is issued."""
@@ -100,7 +137,8 @@ async def start_command(message: Message):
         '3. Подробную информацию о погоде (/detailed город)\n'
         '4. Качество воздуха (/air город)\n'
         '5. Определить погоду по геолокации\n'
-        '6. Сравнить погоду в разных городах (/compare)\n\n'
+        '6. Сравнить погоду в разных городах (/compare)\n'
+        '7. Показать погодные предупреждения (/alerts город)\n\n'
         'Используйте кнопку ниже, чтобы отправить свою геолокацию!',
         reply_markup=create_main_keyboard()
     )
@@ -115,11 +153,13 @@ async def help_command(message: Message):
         '3. /detailed ГОРОД - подробная информация\n'
         '4. /air ГОРОД - качество воздуха\n'
         '5. /compare - сравнить погоду в городах\n'
-        '6. Нажмите кнопку "📍 Отправить геолокацию" для погоды в вашем месте\n\n'
+        '6. /alerts ГОРОД - погодные предупреждения\n'
+        '7. Нажмите кнопку "📍 Отправить геолокацию" для погоды в вашем месте\n\n'
         'Примеры:\n'
         '- "Москва" - текущая погода\n'
         '- "/forecast Париж" - прогноз на 5 дней\n'
-        '- "/detailed Лондон" - подробная информация',
+        '- "/detailed Лондон" - подробная информация\n'
+        '- "/alerts Москва" - погодные предупреждения',
         reply_markup=create_main_keyboard()
     )
 
@@ -153,8 +193,13 @@ async def detailed_command(message: Message):
         weather_response = requests.get(weather_url)
         weather_data = weather_response.json()
         
+        # Check for weather alerts
+        alerts = check_weather_alerts(weather_data)
+        
         # Format and send detailed weather information
         detailed_message = format_detailed_weather(weather_data, city)
+        if alerts:
+            detailed_message += "\n\n" + "\n".join(alerts)
         await message.answer(detailed_message)
         
     except Exception as e:
@@ -243,8 +288,13 @@ async def handle_location(message: Message):
         # Get city name from coordinates
         city_name = weather_data['name']
         
+        # Check for weather alerts
+        alerts = check_weather_alerts(weather_data)
+        
         # Format and send detailed weather information
         detailed_message = format_detailed_weather(weather_data, city_name)
+        if alerts:
+            detailed_message += "\n\n" + "\n".join(alerts)
         await message.answer(detailed_message)
         
     except Exception as e:
@@ -399,6 +449,53 @@ async def forecast_command(message: Message):
             "Пожалуйста, попробуйте позже."
         )
 
+@dp.message(Command('alerts'))
+async def alerts_command(message: Message):
+    """Get weather alerts for the specified city."""
+    try:
+        city = message.text.split(' ', 1)[1]
+    except IndexError:
+        await message.answer(
+            "Пожалуйста, укажите город после команды.\n"
+            "Например: /alerts Москва"
+        )
+        return
+
+    try:
+        # Get coordinates first
+        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
+        geo_response = requests.get(geo_url)
+        geo_data = geo_response.json()
+        
+        if not geo_data:
+            await message.answer("Извините, не могу найти такой город. Попробуйте другой.")
+            return
+            
+        lat = geo_data[0]['lat']
+        lon = geo_data[0]['lon']
+        
+        # Get weather data
+        weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+        weather_response = requests.get(weather_url)
+        weather_data = weather_response.json()
+        
+        # Check for weather alerts
+        alerts = check_weather_alerts(weather_data)
+        
+        if alerts:
+            alert_message = f"⚠️ Погодные предупреждения для города {city}:\n\n" + "\n".join(alerts)
+        else:
+            alert_message = f"✅ Опасных погодных явлений в городе {city} не обнаружено"
+        
+        await message.answer(alert_message)
+        
+    except Exception as e:
+        logging.error(f"Error getting weather alerts: {e}")
+        await message.answer(
+            "Извините, произошла ошибка при получении погодных предупреждений. "
+            "Пожалуйста, попробуйте позже."
+        )
+
 @dp.message()
 async def get_weather(message: Message):
     """Get current weather for the specified city."""
@@ -426,8 +523,13 @@ async def get_weather(message: Message):
         weather_response = requests.get(weather_url)
         weather_data = weather_response.json()
         
+        # Check for weather alerts
+        alerts = check_weather_alerts(weather_data)
+        
         # Format and send detailed weather information
         detailed_message = format_detailed_weather(weather_data, city)
+        if alerts:
+            detailed_message += "\n\n" + "\n".join(alerts)
         await message.answer(detailed_message)
         
     except Exception as e:
@@ -437,27 +539,88 @@ async def get_weather(message: Message):
             "Пожалуйста, попробуйте позже."
         )
 
-async def set_commands():
-    """Set bot commands in the menu."""
+async def on_startup(app):
+    """Действия при запуске бота"""
+    webhook_url = os.environ.get('WEBHOOK_URL')
+    if not webhook_url:
+        logging.error("WEBHOOK_URL не установлен!")
+        sys.exit(1)
+        
+    webhook_path = webhook_url.rstrip('/') + '/webhook'
+    
+    # Удаляем старый вебхук и устанавливаем новый
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(webhook_path)
+    
+    # Устанавливаем команды бота
     await bot.set_my_commands(COMMANDS)
+    
+    webhook_info = await bot.get_webhook_info()
+    logging.info(f"Вебхук установлен: {webhook_info.url}")
 
-def signal_handler(sig, frame):
-    print('Завершение работы бота...')
-    sys.exit(0)
+async def on_shutdown(app):
+    """Действия при остановке бота"""
+    # Удаляем вебхук при выключении
+    await bot.delete_webhook()
+    logging.info("Вебхук удален")
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+def setup_routes(app):
+    """Настройка маршрутов"""
+    app.router.add_post('/webhook', handle_webhook)
+    app.router.add_get('/', lambda r: web.Response(text="Бот работает!"))
+
+async def handle_webhook(request):
+    """Обработчик вебхуков от Telegram"""
+    try:
+        data = await request.json()
+        update = types.Update(**data)
+        await dp.feed_update(bot=bot, update=update)
+        return web.Response(text='ok', status=200)
+    except Exception as e:
+        logging.error(f"Ошибка обработки вебхука: {e}")
+        return web.Response(text='error', status=500)
 
 async def main():
-    """Start the bot."""
-    # Set bot commands
-    await set_commands()
+    """Запуск приложения"""
+    logging.info("Запуск бота...")
     
-    # Start polling
-    await dp.start_polling(bot)
+    # Создаем приложение
+    app = web.Application()
+    
+    # Добавляем обработчики запуска и остановки
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
+    # Настраиваем маршруты
+    setup_routes(app)
+    
+    # Получаем порт
+    port = int(os.environ.get('PORT', 8080))
+    
+    # Запускаем приложение
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    
+    try:
+        await site.start()
+        logging.info(f"Бот запущен на порту {port}")
+        
+        # Держим приложение запущенным
+        while True:
+            await asyncio.sleep(3600)
+            
+    except Exception as e:
+        logging.error(f"Ошибка: {e}")
+        raise
+    finally:
+        await runner.cleanup()
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print('Бот остановлен') 
+        logging.info('Бот остановлен')
+    except Exception as e:
+        logging.error(f"Критическая ошибка: {e}")
+        sys.exit(1) 
