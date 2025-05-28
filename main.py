@@ -985,49 +985,94 @@ async def get_city_coordinates(city_name: str) -> tuple[float, float, str] | Non
     Возвращает кортеж (lat, lon, normalized_city_name) или None если город не найден.
     """
     try:
-        # Кодируем название города для URL
-        encoded_city = quote(city_name)
-        
-        # Пробуем найти город сначала на русском
-        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={encoded_city}&limit=1&appid={OPENWEATHER_API_KEY}&lang=ru"
-        
+        # Список API для поиска города (в порядке приоритета)
+        search_apis = [
+            # OpenWeatherMap Geocoding API
+            {
+                'url': lambda city: f"http://api.openweathermap.org/geo/1.0/direct?q={quote(city)}&limit=1&appid={OPENWEATHER_API_KEY}&lang=ru",
+                'extract': lambda data: (
+                    float(data[0]['lat']),
+                    float(data[0]['lon']),
+                    data[0].get('local_names', {}).get('ru') or data[0]['name']
+                ) if data else None
+            },
+            # Nominatim API
+            {
+                'url': lambda city: (
+                    f"https://nominatim.openstreetmap.org/search"
+                    f"?format=json&q={quote(city)}&limit=1&country=ru"
+                ),
+                'headers': {'User-Agent': 'WeatherBot/1.0'},
+                'extract': lambda data: (
+                    float(data[0]['lat']),
+                    float(data[0]['lon']),
+                    data[0]['display_name'].split(',')[0]
+                ) if data else None
+            },
+            # Дополнительный поиск через OpenWeatherMap без языка
+            {
+                'url': lambda city: f"http://api.openweathermap.org/geo/1.0/direct?q={quote(city)}&limit=1&appid={OPENWEATHER_API_KEY}",
+                'extract': lambda data: (
+                    float(data[0]['lat']),
+                    float(data[0]['lon']),
+                    data[0]['name']
+                ) if data else None
+            }
+        ]
+
+        # Пробуем каждый API по очереди
         async with aiohttp.ClientSession() as session:
-            async with session.get(geo_url) as response:
-                geo_data = await response.json()
-                
-        if not geo_data:
-            # Если город не найден, пробуем искать на английском
-            geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={encoded_city}&limit=1&appid={OPENWEATHER_API_KEY}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(geo_url) as response:
-                    geo_data = await response.json()
-        
-        if not geo_data:
-            # Если все еще не найден, пробуем через Nominatim API
-            nominatim_url = (
-                f"https://nominatim.openstreetmap.org/search"
-                f"?format=json&q={encoded_city}&limit=1"
-            )
-            async with aiohttp.ClientSession() as session:
-                async with session.get(nominatim_url, headers={'User-Agent': 'WeatherBot/1.0'}) as response:
-                    nominatim_data = await response.json()
+            for api in search_apis:
+                try:
+                    headers = api.get('headers', {})
+                    url = api['url'](city_name)
                     
-            if nominatim_data:
-                return (
-                    float(nominatim_data[0]['lat']),
-                    float(nominatim_data[0]['lon']),
-                    nominatim_data[0]['display_name'].split(',')[0]
-                )
-            return None
-        
-        # Получаем локализованное название города, если доступно
-        local_names = geo_data[0].get('local_names', {})
-        city_name = local_names.get('ru') or local_names.get('en') or geo_data[0]['name']
-        
-        return float(geo_data[0]['lat']), float(geo_data[0]['lon']), city_name
-        
+                    async with session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if data:  # Если получили непустой ответ
+                                result = api['extract'](data)
+                                if result:
+                                    return result
+                except Exception as e:
+                    logging.warning(f"Error with geocoding API: {e}")
+                    continue
+
+        # Если город все еще не найден, пробуем прямой поиск по базе городов России
+        russian_cities = {
+            'москва': (55.7558, 37.6173, 'Москва'),
+            'санкт-петербург': (59.9343, 30.3351, 'Санкт-Петербург'),
+            'новосибирск': (55.0084, 82.9357, 'Новосибирск'),
+            'екатеринбург': (56.8519, 60.6122, 'Екатеринбург'),
+            'нижний новгород': (56.2965, 43.9361, 'Нижний Новгород'),
+            'казань': (55.7887, 49.1221, 'Казань'),
+            'челябинск': (55.1644, 61.4368, 'Челябинск'),
+            'омск': (54.9885, 73.3242, 'Омск'),
+            'самара': (53.1959, 50.1001, 'Самара'),
+            'ростов-на-дону': (47.2313, 39.7233, 'Ростов-на-Дону'),
+            'уфа': (54.7348, 55.9578, 'Уфа'),
+            'красноярск': (56.0090, 92.8719, 'Красноярск'),
+            'воронеж': (51.6720, 39.1843, 'Воронеж'),
+            'пермь': (58.0105, 56.2502, 'Пермь'),
+            'волгоград': (48.7194, 44.5018, 'Волгоград'),
+            'саратов': (51.5406, 46.0086, 'Саратов'),
+            'краснодар': (45.0355, 38.9753, 'Краснодар'),
+            'тюмень': (57.1529, 65.5343, 'Тюмень'),
+            'тольятти': (53.5303, 49.3461, 'Тольятти'),
+            'ижевск': (56.8498, 53.2045, 'Ижевск')
+        }
+
+        # Проверяем совпадение с базой городов (с учетом разных вариантов написания)
+        city_lower = city_name.lower().replace('ё', 'е')
+        for known_city, coords in russian_cities.items():
+            if city_lower == known_city or city_lower in known_city or known_city in city_lower:
+                return coords
+
+        # Если город не найден всеми способами
+        return None
+
     except Exception as e:
-        logging.error(f"Error getting coordinates for city {city_name}: {e}")
+        logging.error(f"Error in get_city_coordinates: {e}")
         return None
 
 @dp.message()
@@ -1223,10 +1268,14 @@ async def subscribe_command(message: Message):
         result = await get_city_coordinates(city)
         if not result:
             await message.answer(
-                "Извините, не могу найти такой город. Попробуйте:\n"
-                "1. Проверить правильность написания\n"
-                "2. Использовать название на русском или английском\n"
-                "3. Указать более крупный город поблизости"
+                "Извините, не могу найти указанный город. Пожалуйста:\n"
+                "1. Проверьте правильность написания\n"
+                "2. Убедитесь, что название города написано правильно\n"
+                "3. Попробуйте указать более крупный город поблизости\n\n"
+                "Примеры правильного написания:\n"
+                "✅ Саратов\n"
+                "✅ Нижний Новгород\n"
+                "✅ Санкт-Петербург"
             )
             return
             
@@ -1237,7 +1286,19 @@ async def subscribe_command(message: Message):
         if (normalized_city, lat, lon) not in weather_subscriptions[user_id]:
             weather_subscriptions[user_id].append((normalized_city, lat, lon))
             save_subscriptions()
-            await message.answer(f"✅ Вы успешно подписались на уведомления о погоде в городе {normalized_city}")
+            
+            # Сразу получаем текущую погоду для подтверждения
+            weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(weather_url) as response:
+                    weather_data = await response.json()
+            
+            await message.answer(
+                f"✅ Вы успешно подписались на уведомления о погоде в городе {normalized_city}\n\n"
+                f"Текущая погода:\n"
+                f"🌡 Температура: {weather_data['main']['temp']:.1f}°C\n"
+                f"☁️ {weather_data['weather'][0]['description']}"
+            )
         else:
             await message.answer(f"Вы уже подписаны на уведомления о погоде в городе {normalized_city}")
         
@@ -1327,15 +1388,38 @@ async def stats_command(message: Message):
 @dp.message(Command('shelter'))
 async def shelter_command(message: Message):
     """Поиск укрытия от непогоды"""
-    if not message.location:
-        await message.answer(
-            "Пожалуйста, отправьте свою геолокацию, чтобы я мог найти ближайшие укрытия."
-        )
-        return
-
     try:
-        lat = message.location.latitude
-        lon = message.location.longitude
+        # Проверяем, передано ли название города
+        try:
+            city = message.text.split(' ', 1)[1]
+            # Получаем координаты города
+            result = await get_city_coordinates(city)
+            if not result:
+                await message.answer(
+                    "Извините, не могу найти такой город. Попробуйте:\n"
+                    "1. Проверить правильность написания\n"
+                    "2. Использовать название на русском или английском\n"
+                    "3. Указать более крупный город поблизости\n\n"
+                    "Или отправьте свою геолокацию, нажав на кнопку ниже 📍"
+                )
+                return
+            lat, lon, normalized_city = result
+        except IndexError:
+            # Если город не указан, запрашиваем геолокацию
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]
+                ],
+                resize_keyboard=True,
+                one_time_keyboard=True
+            )
+            await message.answer(
+                "Пожалуйста, отправьте свою геолокацию, нажав на кнопку ниже, "
+                "или укажите название города после команды:\n"
+                "Например: /shelter Москва",
+                reply_markup=keyboard
+            )
+            return
         
         # Получаем список ближайших укрытий
         shelters = await find_nearby_shelters(lat, lon)
@@ -1348,16 +1432,32 @@ async def shelter_command(message: Message):
             return
         
         # Формируем сообщение с укрытиями
-        message_text = "🏪 Ближайшие места, где можно укрыться от непогоды:\n\n"
+        message_text = f"🏪 Ближайшие места, где можно укрыться от непогоды в районе {normalized_city if 'normalized_city' in locals() else 'вашей геолокации'}:\n\n"
+        
         for place in shelters:
             distance = ((float(place['lat']) - lat) ** 2 + (float(place['lon']) - lon) ** 2) ** 0.5 * 111  # примерное расстояние в км
+            name = place['display_name'].split(',')[0]
+            address = ', '.join(place['display_name'].split(',')[1:]).strip()
+            
             message_text += (
-                f"📍 {place['display_name'].split(',')[0]}\n"
-                f"   Расстояние: {distance:.1f} км\n"
-                f"   Адрес: {place['display_name']}\n\n"
+                f"📍 {name}\n"
+                f"   📏 Расстояние: {distance:.1f} км\n"
+                f"   🏠 Адрес: {address}\n\n"
+            )
+            
+            # Добавляем кнопку для открытия карты
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🗺 Открыть на карте",
+                            url=f"https://www.openstreetmap.org/?mlat={place['lat']}&mlon={place['lon']}&zoom=17"
+                        )
+                    ]
+                ]
             )
         
-        await message.answer(message_text)
+        await message.answer(message_text, reply_markup=keyboard)
         
     except Exception as e:
         logging.error(f"Error in shelter_command: {e}")
