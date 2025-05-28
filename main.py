@@ -16,6 +16,7 @@ import math
 import json
 from collections import defaultdict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from urllib.parse import quote
 
 # Load environment variables
 load_dotenv()
@@ -376,28 +377,30 @@ async def detailed_command(message: Message):
         return
 
     try:
-        # Get coordinates first
-        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
-        geo_response = requests.get(geo_url)
-        geo_data = geo_response.json()
-        
-        if not geo_data:
-            await message.answer("Извините, не могу найти такой город. Попробуйте другой.")
+        # Получаем координаты города
+        result = await get_city_coordinates(city)
+        if not result:
+            await message.answer(
+                "Извините, не могу найти такой город. Попробуйте:\n"
+                "1. Проверить правильность написания\n"
+                "2. Использовать название на русском или английском\n"
+                "3. Указать более крупный город поблизости"
+            )
             return
             
-        lat = geo_data[0]['lat']
-        lon = geo_data[0]['lon']
+        lat, lon, normalized_city = result
         
         # Get detailed weather data
         weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-        weather_response = requests.get(weather_url)
-        weather_data = weather_response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                weather_data = await response.json()
         
         # Check for weather alerts
         alerts = check_weather_alerts(weather_data)
         
         # Format and send detailed weather information
-        detailed_message = format_detailed_weather(weather_data, city)
+        detailed_message = format_detailed_weather(weather_data, normalized_city)
         if alerts:
             detailed_message += "\n\n" + "\n".join(alerts)
         await message.answer(detailed_message)
@@ -972,6 +975,57 @@ async def process_zoom(callback_query: types.CallbackQuery):
         logging.error(f"Error in process_zoom: {e}")
         await callback_query.answer("Произошла ошибка при изменении масштаба")
 
+async def get_city_coordinates(city_name: str) -> tuple[float, float, str] | None:
+    """
+    Получает координаты города с поддержкой разных языков и форматов написания.
+    Возвращает кортеж (lat, lon, normalized_city_name) или None если город не найден.
+    """
+    try:
+        # Кодируем название города для URL
+        encoded_city = quote(city_name)
+        
+        # Пробуем найти город сначала на русском
+        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={encoded_city}&limit=1&appid={OPENWEATHER_API_KEY}&lang=ru"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(geo_url) as response:
+                geo_data = await response.json()
+                
+        if not geo_data:
+            # Если город не найден, пробуем искать на английском
+            geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={encoded_city}&limit=1&appid={OPENWEATHER_API_KEY}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(geo_url) as response:
+                    geo_data = await response.json()
+        
+        if not geo_data:
+            # Если все еще не найден, пробуем через Nominatim API
+            nominatim_url = (
+                f"https://nominatim.openstreetmap.org/search"
+                f"?format=json&q={encoded_city}&limit=1"
+            )
+            async with aiohttp.ClientSession() as session:
+                async with session.get(nominatim_url, headers={'User-Agent': 'WeatherBot/1.0'}) as response:
+                    nominatim_data = await response.json()
+                    
+            if nominatim_data:
+                return (
+                    float(nominatim_data[0]['lat']),
+                    float(nominatim_data[0]['lon']),
+                    nominatim_data[0]['display_name'].split(',')[0]
+                )
+            return None
+        
+        # Получаем локализованное название города, если доступно
+        local_names = geo_data[0].get('local_names', {})
+        city_name = local_names.get('ru') or local_names.get('en') or geo_data[0]['name']
+        
+        return float(geo_data[0]['lat']), float(geo_data[0]['lon']), city_name
+        
+    except Exception as e:
+        logging.error(f"Error getting coordinates for city {city_name}: {e}")
+        return None
+
 @dp.message()
 async def get_weather(message: Message):
     """Get current weather for the specified city."""
@@ -979,31 +1033,31 @@ async def get_weather(message: Message):
         await help_command(message)
         return
 
-    city = message.text
-    
     try:
-        # Get coordinates first
-        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
-        geo_response = requests.get(geo_url)
-        geo_data = geo_response.json()
-        
-        if not geo_data:
-            await message.answer("Извините, не могу найти такой город. Попробуйте другой.")
+        # Получаем координаты города
+        result = await get_city_coordinates(message.text)
+        if not result:
+            await message.answer(
+                "Извините, не могу найти такой город. Попробуйте:\n"
+                "1. Проверить правильность написания\n"
+                "2. Использовать название на русском или английском\n"
+                "3. Указать более крупный город поблизости"
+            )
             return
             
-        lat = geo_data[0]['lat']
-        lon = geo_data[0]['lon']
+        lat, lon, normalized_city = result
         
         # Get weather data
         weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=ru"
-        weather_response = requests.get(weather_url)
-        weather_data = weather_response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as response:
+                weather_data = await response.json()
         
         # Check for weather alerts
         alerts = check_weather_alerts(weather_data)
         
         # Format and send detailed weather information
-        detailed_message = format_detailed_weather(weather_data, city)
+        detailed_message = format_detailed_weather(weather_data, normalized_city)
         if alerts:
             detailed_message += "\n\n" + "\n".join(alerts)
         await message.answer(detailed_message)
@@ -1145,26 +1199,26 @@ async def subscribe_command(message: Message):
 
     try:
         # Получаем координаты города
-        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(geo_url) as response:
-                geo_data = await response.json()
-        
-        if not geo_data:
-            await message.answer("Извините, не могу найти такой город. Попробуйте другой.")
+        result = await get_city_coordinates(city)
+        if not result:
+            await message.answer(
+                "Извините, не могу найти такой город. Попробуйте:\n"
+                "1. Проверить правильность написания\n"
+                "2. Использовать название на русском или английском\n"
+                "3. Указать более крупный город поблизости"
+            )
             return
             
-        lat = geo_data[0]['lat']
-        lon = geo_data[0]['lon']
+        lat, lon, normalized_city = result
         
         # Добавляем подписку
         user_id = message.from_user.id
-        if (city, lat, lon) not in weather_subscriptions[user_id]:
-            weather_subscriptions[user_id].append((city, lat, lon))
+        if (normalized_city, lat, lon) not in weather_subscriptions[user_id]:
+            weather_subscriptions[user_id].append((normalized_city, lat, lon))
             save_subscriptions()
-            await message.answer(f"✅ Вы успешно подписались на уведомления о погоде в городе {city}")
+            await message.answer(f"✅ Вы успешно подписались на уведомления о погоде в городе {normalized_city}")
         else:
-            await message.answer(f"Вы уже подписаны на уведомления о погоде в городе {city}")
+            await message.answer(f"Вы уже подписаны на уведомления о погоде в городе {normalized_city}")
         
     except Exception as e:
         logging.error(f"Error in subscribe_command: {e}")
