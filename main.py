@@ -112,6 +112,16 @@ scheduler = None
 app = None
 runner = None
 
+# Database context manager
+@contextmanager
+def get_db():
+    """Контекстный менеджер для работы с базой данных"""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
 # Bot commands for menu
 COMMANDS = [
     BotCommand(command='start', description='Запустить бота'),
@@ -2826,19 +2836,6 @@ async def shelter_command(message: Message):
 
 # Database configuration
 DB_FILE = 'weather_bot.db'
-
-@contextmanager
-def get_db():
-    """Context manager для работы с базой данных"""
-    conn = sqlite3.connect(DB_FILE)
-    try:
-        yield conn
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 def init_db():
     """Инициализация базы данных"""
